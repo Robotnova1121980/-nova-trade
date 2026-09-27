@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: nova-trade-dashboard
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run dashboard.py --server.port $PORT --server.address 0.0.0.0"
+    autoDeploy: true
+
+  - type: worker
+    name: nova-trade-engine
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python engine.py"
+    autoDeploy: true

@@ -7,14 +7,31 @@ import uuid
 import datetime
 import time
 import json
+import threading
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from storage.mongo_db import MongoManager
 from storage.repositories import EventRepository, TradeDNARepository
 from market.market_state import MarketStateEngine
 from market.live_feed import fetch_live_market_data
 
-FEE_RATE = 0.0004          
+FEE_RATE = 0.0004         
 SLIPPAGE_RATE = 0.0001    
 LEVERAGE = 5
+
+# Server HTTP simplu pentru a satisface cerința de port deschis a Render (Web Service)
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Nova Trade Engine is Running 24/7!")
+    def log_message(self, format, *args):
+        pass # Dezactivează logurile HTTP inutile din consolă
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
 
 class AutonomousScalperEngine:
     def __init__(self, initial_capital=150.0):
@@ -54,7 +71,7 @@ class AutonomousScalperEngine:
         direction = "LONG" if self.trade_counter % 2 != 0 else "SHORT"
         entry_price = ask if direction == "LONG" else bid
 
-        _, confidence_score = self.evaluate_dna_memory(dna_repo, market_state)
+        _, confidence_score = evaluate_dna_memory_helper = self.evaluate_dna_memory(dna_repo, market_state)
         
         # MARJĂ FIXĂ DE 50$ PER TRANZACȚIE (la un capital total de 150$)
         dynamic_margin = 50.0
@@ -145,13 +162,15 @@ class AutonomousScalperEngine:
         return pnl, "HOLD_ACTIVE"
 
 def run_live_trading_loop():
+    # Pornește serverul web de fundal pentru Render
+    threading.Thread(target=start_health_server, daemon=True).start()
+    
     print("\n--- [NOVA TRADE v0.5] Motor Pornit (Capital: $150 | Marjă Tranzacție: $50) ---")
     mongo = MongoManager()
     events = EventRepository(mongo)
     dna_repo = TradeDNARepository(mongo)
     market_engine = MarketStateEngine()
     
-    # Capital inițial setat strict la 150.0$
     scalper = AutonomousScalperEngine(initial_capital=150.0)
 
     try:
@@ -208,7 +227,6 @@ def run_live_trading_loop():
                     except Exception:
                         pass
 
-            # Export de stare pentru dashboard
             state_data = {
                 "timestamp": timestamp_str,
                 "capital": scalper.capital,

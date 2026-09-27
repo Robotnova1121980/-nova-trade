@@ -1,6 +1,6 @@
 """
 engine.py
-Nova Trade v0.5 - Capital Total 150$ | Marjă Tranzacție 50$
+Nova Trade v0.6 - Capital Total 150$ | Marjă Tranzacție 50$ + Web Dashboard integrat
 """
 
 import uuid
@@ -19,18 +19,115 @@ FEE_RATE = 0.0004
 SLIPPAGE_RATE = 0.0001    
 LEVERAGE = 5
 
-# Server HTTP simplu pentru a satisface cerința de port deschis a Render (Web Service)
-class HealthCheckHandler(BaseHTTPRequestHandler):
+# Server HTTP cu Dashboard Web Integrat care citește starea motorului
+class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Nova Trade Engine is Running 24/7!")
+        if self.path == "/" or self.path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            
+            # Încercăm să citim starea curentă din motor_state.json
+            state = {
+                "timestamp": "N/A",
+                "capital": 150.0,
+                "mid_price": 0.0,
+                "wins": 0,
+                "losses": 0,
+                "active_position": None,
+                "current_pnl": 0.0,
+                "status": "INITIALIZING"
+            }
+            try:
+                if os.path.exists("motor_state.json"):
+                    with open("motor_state.json", "r") as f:
+                        state = json.load(f)
+            except Exception:
+                pass
+
+            html_content = f"""
+            <!DOCTYPE html>
+            <html lang="ro">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Nova Trade Engine - Live Dashboard</title>
+                <meta http-equiv="refresh" content="3">
+                <style>
+                    body {{ background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; }}
+                    .container {{ max-width: 900px; margin: 0 auto; }}
+                    header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 15px; margin-bottom: 25px; }}
+                    h1 {{ margin: 0; font-size: 24px; color: #38bdf8; }}
+                    .badge {{ background: #22c55e; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; }}
+                    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }}
+                    .card {{ background: #1e293b; padding: 20px; border-radius: 10px; border: 1px solid #334155; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }}
+                    .card h3 {{ margin: 0 0 10px 0; font-size: 14px; color: #94a3b8; text-transform: uppercase; }}
+                    .card .value {{ font-size: 22px; font-weight: bold; }}
+                    .pos-box {{ background: #1e293b; padding: 20px; border-radius: 10px; border: 1px solid #334155; margin-bottom: 25px; }}
+                    .actions {{ display: flex; gap: 15px; margin-top: 25px; }}
+                    .btn {{ background: #0284c7; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-weight: bold; cursor: pointer; transition: background 0.2s; }}
+                    .btn:hover {{ background: #0369a1; }}
+                    .btn-danger {{ background: #dc2626; }}
+                    .btn-danger:hover {{ background: #b91c1c; }}
+                    .footer {{ text-align: center; color: #64748b; font-size: 12px; margin-top: 40px; }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <header>
+                        <h1>⚡ Nova Trade Dashboard</h1>
+                        <span class="badge">LIVE 24/7</span>
+                    </header>
+                    
+                    <div class="grid">
+                        <div class="card">
+                            <h3>Capital Total</h3>
+                            <div class="value" style="color: #38bdf8;">${state.get('capital', 150.0):.2f}</div>
+                        </div>
+                        <div class="card">
+                            <h3>Preț BTC (Mid)</h3>
+                            <div class="value">${state.get('mid_price', 0):,.2f} USD</div>
+                        </div>
+                        <div class="card">
+                            <h3>Win / Loss</h3>
+                            <div class="value"><span style="color: #22c55e;">{state.get('wins', 0)}W</span> / <span style="color: #ef4444;">{state.get('losses', 0)}L</span></div>
+                        </div>
+                        <div class="card">
+                            <h3>Ultima Actualizare</h3>
+                            <div class="value" style="font-size: 16px; color: #cbd5e1;">{state.get('timestamp', 'N/A')}</div>
+                        </div>
+                    </div>
+
+                    <div class="pos-box">
+                        <h3>Stare Poziție Curentă & Execuție</h3>
+                        <p><b>Status Motor:</b> {state.get('status', 'HOLD')}</p>
+                        <p><b>Poziție Activă:</b> {json.dumps(state.get('active_position', None), indent=2) if state.get('active_position') else 'Nicio poziție deschisă momentan'}</p>
+                        <p><b>PnL Nerealizat / Curent:</b> <span style="color: {'#22c55e' if state.get('current_pnl', 0) >= 0 else '#ef4444'};">${state.get('current_pnl', 0):+.4f}</span></p>
+                    </div>
+
+                    <div class="actions">
+                        <button class="btn btn-danger" onclick="alert('Funcționalitate de oprire manuală în curând!')">🛑 Oprire Manuală</button>
+                        <button class="btn" onclick="alert('Setare marjă/fonduri în curând!')">⚙️ Gestionează Fonduri</button>
+                    </div>
+
+                    <div class="footer">
+                        Nova Trade Autonomous Engine &bull; Se actualizează automat la fiecare 3 secunde.
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            self.wfile.write(html_content.encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def log_message(self, format, *args):
-        pass # Dezactivează logurile HTTP inutile din consolă
+        pass
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server = HTTPServer(('0.0.0.0', port), DashboardHandler)
     server.serve_forever()
 
 class AutonomousScalperEngine:
@@ -71,14 +168,13 @@ class AutonomousScalperEngine:
         direction = "LONG" if self.trade_counter % 2 != 0 else "SHORT"
         entry_price = ask if direction == "LONG" else bid
 
-        _, confidence_score = evaluate_dna_memory_helper = self.evaluate_dna_memory(dna_repo, market_state)
+        _, confidence_score = self.evaluate_dna_memory(dna_repo, market_state)
         
-        # MARJĂ FIXĂ DE 50$ PER TRANZACȚIE (la un capital total de 150$)
         dynamic_margin = 50.0
         if self.capital < dynamic_margin:
-            dynamic_margin = self.capital  # Siguranță în caz că scade capitalul sub 50$
+            dynamic_margin = self.capital
 
-        notional = dynamic_margin * LEVERAGE  # 50$ * 5 = 250$ poziție
+        notional = dynamic_margin * LEVERAGE  
         entry_fee = notional * FEE_RATE
 
         base_tp_dist = entry_price * 0.0015  
@@ -162,10 +258,9 @@ class AutonomousScalperEngine:
         return pnl, "HOLD_ACTIVE"
 
 def run_live_trading_loop():
-    # Pornește serverul web de fundal pentru Render
     threading.Thread(target=start_health_server, daemon=True).start()
     
-    print("\n--- [NOVA TRADE v0.5] Motor Pornit (Capital: $150 | Marjă Tranzacție: $50) ---")
+    print("\n--- [NOVA TRADE v0.6] Motor Pornit cu Web Dashboard Integrat ---")
     mongo = MongoManager()
     events = EventRepository(mongo)
     dna_repo = TradeDNARepository(mongo)
@@ -229,12 +324,12 @@ def run_live_trading_loop():
 
             state_data = {
                 "timestamp": timestamp_str,
-                "capital": scalper.capital,
-                "mid_price": mid_price,
+                "capital": round(scalper.capital, 2),
+                "mid_price": round(mid_price, 2),
                 "wins": scalper.wins,
                 "losses": scalper.losses,
                 "active_position": scalper.active_position,
-                "current_pnl": pnl,
+                "current_pnl": round(pnl, 4),
                 "status": action if scalper.active_position else "HOLD_ACTIVE"
             }
             try:

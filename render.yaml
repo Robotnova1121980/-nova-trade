@@ -1,4 +1,5 @@
 services:
+  # 1. Dashboard-ul Streamlit (Interfața Web)
   - type: web
     name: nova-trade-dashboard
     env: python
@@ -8,7 +9,8 @@ services:
     startCommand: "streamlit run dashboard.py --server.port $PORT --server.address 0.0.0.0"
     autoDeploy: true
 
-  - type: worker
+  # 2. Motorul de Trading (transformat în web service gratuit pentru a rula stabil)
+  - type: web
     name: nova-trade-engine
     env: python
     region: frankfurt

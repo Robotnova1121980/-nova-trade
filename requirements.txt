@@ -4,3 +4,4 @@ pandas
 pymongo
 requests
 websockets
+python-dotenv

@@ -1,6 +1,6 @@
 """
-engine.py - Nova Trade v2.3 (paper trading, persistență MongoDB, execuție real-time)
-Capital inițial: $150.00 | Simulare pe BTC/USDT (15m)
+engine.py - Nova Trade v3.0 (paper trading, persistență MongoDB, execuție real-time, multi-piață)
+Capital inițial: $150.00 | Scanner pe BTC/USDT, EUR/USD, JPY/USD, aur, petrol, gaze (15m)
 
 Variabile de mediu:
   PORT             portul serverului web (Render îl setează automat)
@@ -8,6 +8,8 @@ Variabile de mediu:
   DASHBOARD_TOKEN  token secret pentru butoanele Stop / Start / Închide poziția
                    (fără el, dashboard-ul e doar de citit). Deschizi /?k=TOKEN
   EXCHANGE         opțional, implicit "binance" (ex: "kraken" dacă Binance dă 451)
+
+v3: marcajele "# v3" arată fiecare zonă adăugată sau modificată față de v2.3.
 """
 
 import datetime
@@ -23,6 +25,11 @@ from urllib.parse import parse_qs, quote, urlparse
 import ccxt
 import numpy as np
 import pandas as pd
+
+try:  # v3: yfinance e folosit doar pentru piețele non-crypto; BTC merge și fără el
+    import yfinance as yf
+except ImportError:  # pragma: no cover
+    yf = None
 
 from storage.mongo_db import MongoManager
 
@@ -41,6 +48,20 @@ COST_RT = 2 * (FEE + SLIPPAGE)
 MIN_EDGE = 3 * COST_RT
 POLL_SECONDS = 30
 MAX_SIGNAL_AGE = 120     # secunde: nu intrăm pe un semnal mai vechi de atât
+STALE_PRICE_SECONDS = 900  # v3: prețul non-crypto mai vechi de 15 min = piață închisă
+
+# v3: piețele scanate. Toate au USD ca monedă de cotare (PnL-ul iese direct în USD).
+#   fee/slip = costuri per tranzacție (ESTIMĂRI pentru paper trading, verifică-le față de brokerul tău).
+#   BTC păstrează exact costurile din v2.3.
+#   JPYUSD=X este inversul lui USD/JPY: strategia e long-only, deci "long JPYUSD" = short USD/JPY.
+MARKETS = {
+    "BTC/USDT": dict(src="ccxt", fee=FEE, slip=SLIPPAGE, max_age=MAX_SIGNAL_AGE),
+    "EURUSD": dict(src="yf", yf="EURUSD=X", fee=0.0, slip=0.00005, max_age=300),
+    "JPYUSD": dict(src="yf", yf="JPYUSD=X", fee=0.0, slip=0.00005, max_age=300),
+    "GOLD": dict(src="yf", yf="GC=F", fee=0.0, slip=0.00015, max_age=300),
+    "OIL": dict(src="yf", yf="CL=F", fee=0.0, slip=0.0003, max_age=300),
+    "GAS": dict(src="yf", yf="NG=F", fee=0.0, slip=0.0005, max_age=300),
+}
 
 STATE_COLLECTION = "motor_state"
 CONTROL_COLLECTION = "motor_control"
@@ -51,7 +72,10 @@ DEFAULTS = dict(
     allow_new_trades=True,
     close_now=False,
     vol_adjust_stop=True,
-    trailing_stop=False,
+    trailing_stop=True,      # v3: era False
+    tp_extend=True,          # v3: când prețul atinge TP, TP-ul se mută mai sus în loc să închidă
+    tp_extend_atr=1.0,       # v3: cu cât se mută TP-ul (în ATR)
+    tp_lock_atr=0.5,         # v3: stop-ul urcă la vechiul TP minus atât (în ATR)
     risk_per_trade=0.015,
     daily_loss_limit=0.05,
     atr_stop_mult=1.5,
@@ -81,6 +105,17 @@ def fnum(v, default=0.0):
         return float(v)
     except (TypeError, ValueError):
         return default
+
+
+def rnd(x):
+    """v3: rotunjire adaptivă (2 zecimale pentru prețuri mari, 6 pentru EURUSD / JPYUSD etc.)."""
+    x = float(x)
+    return round(x, 2 if abs(x) >= 100 else 6)
+
+
+def fmt_price(x):
+    """v3: afișare adaptivă a prețului în dashboard."""
+    return f"{x:,.2f}" if abs(x) >= 100 else f"{x:.6f}"
 
 
 def ser_pos(p):
@@ -113,6 +148,11 @@ def deser_pos(raw):
         for k in ("entry", "stop", "tp", "qty", "fee_in", "atr0", "hh"):
             p[k] = float(p[k])
         p["bars"] = int(p.get("bars", 0))
+        # v3: poziții salvate de v2.3 nu au symbol/fee/slip -> BTC cu costurile vechi
+        p["symbol"] = p.get("symbol") or SYMBOL
+        mk = MARKETS.get(p["symbol"], MARKETS[SYMBOL])
+        p["fee"] = float(p.get("fee", mk["fee"]))
+        p["slip"] = float(p.get("slip", mk["slip"]))
     except Exception as e:
         print("Eroare la restaurarea poziției:", e)
         return None
@@ -226,6 +266,9 @@ pre { background: #0f172a; padding: 10px; border-radius: 6px; overflow-x: auto; 
 def render_dashboard(state, ctl, can_act, token_configured, token):
     cap = fnum(state.get("capital"), START_CAPITAL)
     mid = fnum(state.get("mid_price"))
+    psym = html.escape(str(state.get("price_symbol") or SYMBOL))  # v3
+    scan = state.get("scan") or []  # v3
+    scan_html = html.escape(" | ".join(str(s) for s in scan)) if scan else "n/a"  # v3
     wins = int(fnum(state.get("wins")))
     losses = int(fnum(state.get("losses")))
     pnl = fnum(state.get("current_pnl"))
@@ -266,31 +309,32 @@ def render_dashboard(state, ctl, can_act, token_configured, token):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nova Trade v2.3 - Live Dashboard</title>
+<title>Nova Trade v3 - Live Dashboard</title>
 <meta http-equiv="refresh" content="3">
 <style>{CSS}</style>
 </head>
 <body>
 <div class="container">
   <header>
-    <h1>⚡ Nova Trade v2.3 Dashboard</h1>
+    <h1>⚡ Nova Trade v3 Dashboard</h1>
     <span class="badge" style="background: {badge_color};">{badge_text}</span>
   </header>
   <div class="grid">
     <div class="card"><h3>Capital Total</h3><div class="value" style="color: #38bdf8;">${cap:.2f}</div></div>
-    <div class="card"><h3>Preț BTC (Mid)</h3><div class="value">${mid:,.2f} USD</div></div>
+    <div class="card"><h3>Preț {psym} (Mid)</h3><div class="value">${fmt_price(mid)} USD</div></div>
     <div class="card"><h3>Win / Loss</h3><div class="value"><span style="color: #22c55e;">{wins}W</span> / <span style="color: #ef4444;">{losses}L</span></div></div>
     <div class="card"><h3>Ultima Actualizare (UTC)</h3><div class="value" style="font-size: 16px; color: #cbd5e1;">{stamp}</div></div>
   </div>
   <div class="pos-box">
     <h3>Stare Poziție Curentă &amp; Execuție</h3>
     <p><b>Status Motor:</b> {status}</p>
+    <p><b>Scanner piețe:</b> <span class="note">{scan_html}</span></p>
     <p><b>Risc asumat în poziție:</b> ${margin:.2f}</p>
     <p><b>Poziție Activă:</b> {pos_html}</p>
     <p><b>PnL Curent (estimat, cu comisioane):</b> <span style="color: {pnl_color};">${pnl:+.4f}</span></p>
   </div>
   <div class="actions">{actions}</div>
-  <div class="footer">Nova Trade v2.3 &bull; Paper trading &bull; Se actualizează la fiecare 3 secunde.</div>
+  <div class="footer">Nova Trade v3 &bull; Paper trading &bull; Se actualizează la fiecare 3 secunde.</div>
 </div>
 </body>
 </html>"""
@@ -393,13 +437,103 @@ def add_indicators(df):
     return df
 
 
-def signal(r):
+def signal(r, cost_rt=COST_RT):  # v3: costul round-trip vine din piața respectivă
     return bool(
         r["close"] < r["bb_low"]
         and r["rsi"] < RSI_BUY
         and r["close"] > r["ema_trend"] * (1 - TREND_TOL)
-        and (r["bb_mid"] / r["close"] - 1) > MIN_EDGE
+        and (r["bb_mid"] / r["close"] - 1) > 3 * cost_rt
     )
+
+
+# ------------------------- DATE DE PIAȚĂ (v3) -------------------------
+def _naive_utc(idx):
+    idx = pd.DatetimeIndex(idx)
+    return idx.tz_convert("UTC").tz_localize(None) if idx.tz is not None else idx
+
+
+def fetch_candles(ex, sym):
+    """v3: lumânări 15m pentru orice piață din MARKETS, în același format ca to_frame()."""
+    m = MARKETS[sym]
+    if m["src"] == "ccxt":
+        return to_frame(ex.fetch_ohlcv(sym, TIMEFRAME, limit=400))
+    if yf is None:
+        raise RuntimeError("yfinance nu e instalat")
+    raw = yf.Ticker(m["yf"]).history(period="10d", interval="15m", auto_adjust=False)
+    if raw is None or raw.empty:
+        raise ValueError("fără date de la Yahoo")
+    df = pd.DataFrame({
+        "ts": _naive_utc(raw.index),
+        "open": raw["Open"].to_numpy(dtype=float),
+        "high": raw["High"].to_numpy(dtype=float),
+        "low": raw["Low"].to_numpy(dtype=float),
+        "close": raw["Close"].to_numpy(dtype=float),
+        "volume": raw["Volume"].to_numpy(dtype=float) if "Volume" in raw else 0.0,
+    })
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    return df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+
+
+def fetch_price(ex, sym):
+    """v3: (preț, proaspăt?). Pentru non-crypto, 'proaspăt' = ultima lumânare de 1m e recentă (piață deschisă)."""
+    m = MARKETS[sym]
+    if m["src"] == "ccxt":
+        t = ex.fetch_ticker(sym)
+        return fnum(t.get("last") or t.get("close")), True
+    if yf is None:
+        raise RuntimeError("yfinance nu e instalat")
+    h = yf.Ticker(m["yf"]).history(period="1d", interval="1m", auto_adjust=False)
+    if h is None or h.empty:
+        return 0.0, False
+    px = fnum(h["Close"].iloc[-1])
+    age = (utc_now() - _naive_utc(h.index)[-1]).total_seconds()
+    return px, age <= STALE_PRICE_SECONDS
+
+
+def scan_markets(ex, now, slot, scanned, scan_info):
+    """v3: evaluează fiecare piață pe ultima lumânare închisă. Întoarce (scor, simbol, bară) pentru cel mai bun semnal sau None."""
+    best = None
+    age = (now - slot).total_seconds()
+    expected = slot - pd.Timedelta(minutes=BAR_MINUTES)
+    for sym, m in MARKETS.items():
+        if scanned.get(sym) == slot:
+            continue
+        if m["src"] == "yf" and yf is None:
+            scan_info[sym] = "yfinance lipsă"
+            scanned[sym] = slot
+            continue
+        try:
+            df = add_indicators(fetch_candles(ex, sym))
+        except Exception as e:
+            print(f"Eroare date {sym}:", e, flush=True)
+            scan_info[sym] = "eroare date"
+            if age > m["max_age"]:
+                scanned[sym] = slot
+            continue
+        closed = df[df["ts"] + pd.Timedelta(minutes=BAR_MINUTES) <= slot].dropna().reset_index(drop=True)
+        if len(closed) == 0:
+            scan_info[sym] = "date insuficiente"
+            if age > m["max_age"]:
+                scanned[sym] = slot
+            continue
+        bar = closed.iloc[-1]
+        if bar["ts"] != expected:
+            # lumânarea așteptată lipsește: piață închisă (bară veche) sau date întârziate (reîncercăm)
+            stale_market = bar["ts"] < expected - pd.Timedelta(minutes=2 * BAR_MINUTES)
+            scan_info[sym] = "piață închisă" if stale_market else "aștept bara nouă"
+            if stale_market or age > m["max_age"]:
+                scanned[sym] = slot
+            continue
+        scanned[sym] = slot
+        cost_rt = 2 * (m["fee"] + m["slip"])
+        if age <= m["max_age"] and signal(bar, cost_rt):
+            score = float((bar["bb_mid"] - bar["close"]) / bar["atr"])
+            scan_info[sym] = f"SEMNAL (scor {score:.2f})"
+            if best is None or score > best[0]:
+                best = (score, sym, bar)
+        else:
+            scan_info[sym] = "fără semnal"
+    return best
 
 
 # --------------------------- MOTOR ---------------------------
@@ -435,11 +569,13 @@ class Engine:
         p = self.pos
         if p is None:
             return 0.0
-        return p["qty"] * (price - p["entry"]) - p["fee_in"] - p["qty"] * price * FEE
+        return p["qty"] * (price - p["entry"]) - p["fee_in"] - p["qty"] * price * p.get("fee", FEE)  # v3
 
-    def _open(self, bar, price):
+    def _open(self, bar, price, symbol=SYMBOL):  # v3: symbol
         c = self.cfg
-        entry = float(price) * (1 + SLIPPAGE)
+        mk = MARKETS[symbol]  # v3
+        fee, slip = mk["fee"], mk["slip"]  # v3
+        entry = float(price) * (1 + slip)
         atr, atr_avg, bb_mid = float(bar["atr"]), float(bar["atr_avg"]), float(bar["bb_mid"])
         mult = c["atr_stop_mult"]
         if c["vol_adjust_stop"] and atr > 1.5 * atr_avg:
@@ -448,21 +584,25 @@ class Engine:
         if stop <= 0 or stop >= entry or tp <= entry:
             return
         qty = (self.equity * c["risk_per_trade"]) / (entry - stop)
-        qty = min(qty, self.equity * 0.99 / (entry * (1 + FEE)))
+        qty = min(qty, self.equity * 0.99 / (entry * (1 + fee)))
         if qty <= 0:
             return
         self.pos = dict(
             entry=entry, stop=stop, tp=tp, qty=float(qty), bars=0, hh=entry,
-            atr0=atr, fee_in=float(qty * entry * FEE), t=bar["ts"],
+            atr0=atr, fee_in=float(qty * entry * fee), t=bar["ts"],
             t_open=utc_now(), margin=round(self.equity * c["risk_per_trade"], 2),
+            symbol=symbol, fee=fee, slip=slip,  # v3
         )
-        self.log(f"{utc_now()} BUY {qty:.6f} @ {entry:.2f} SL {stop:.2f} TP {tp:.2f}")
+        self.log(f"{utc_now()} BUY {symbol} {qty:.6f} @ {rnd(entry)} SL {rnd(stop)} TP {rnd(tp)}")
 
     def check_position_realtime(self, price, now):
         """Verifică stop/TP/timp pe prețul live. Întoarce (închis?, motiv/status)."""
         p, c = self.pos, self.cfg
         if p is None or price <= 0:
             return False, "HOLD"
+
+        slip = p.get("slip", SLIPPAGE)  # v3
+        cost_rt = 2 * (p.get("fee", FEE) + slip)  # v3
 
         p["bars"] = int((now - p["t_open"]).total_seconds() // (BAR_MINUTES * 60))
 
@@ -472,25 +612,32 @@ class Engine:
         elif c["trailing_stop"]:
             p["hh"] = max(p["hh"], price)
             if p["hh"] >= p["entry"] + c["trail_activate_atr"] * p["atr0"]:
-                p["stop"] = max(p["stop"], p["entry"] * (1 + COST_RT),
+                p["stop"] = max(p["stop"], p["entry"] * (1 + cost_rt),
                                 p["hh"] - c["trail_atr"] * p["atr0"])
         if mt:
             p["tp"] = mt
 
         if price <= p["stop"]:
-            self._close(min(price, p["stop"]) * (1 - SLIPPAGE), "STOP", now)
+            self._close(min(price, p["stop"]) * (1 - slip), "STOP", now)
             return True, "STOP_LOSS"
         if price >= p["tp"]:
+            # v3: TP dinamic - când prețul atinge ținta, o mutăm mai sus și blocăm profitul cu stop-ul
+            if c.get("tp_extend") and c["trailing_stop"] and not mt and not ms:
+                old_tp = p["tp"]
+                p["tp"] = max(price, old_tp) + c["tp_extend_atr"] * p["atr0"]
+                p["stop"] = max(p["stop"], old_tp - c["tp_lock_atr"] * p["atr0"])
+                self.log(f"{now} TP extins pentru {p.get('symbol', SYMBOL)}: nou TP {rnd(p['tp'])}, SL {rnd(p['stop'])}")
+                return False, "HOLD_ACTIVE"
             self._close(p["tp"], "TP", now)
             return True, "TAKE_PROFIT"
         if p["bars"] >= MAX_BARS:
-            self._close(price * (1 - SLIPPAGE), "TIME", now)
+            self._close(price * (1 - slip), "TIME", now)
             return True, "TIME_EXIT"
         return False, "HOLD_ACTIVE"
 
     def _close(self, px, why, ts):
         p = self.pos
-        pnl = p["qty"] * (px - p["entry"]) - p["fee_in"] - p["qty"] * px * FEE
+        pnl = p["qty"] * (px - p["entry"]) - p["fee_in"] - p["qty"] * px * p.get("fee", FEE)  # v3
         self.equity += pnl
         if pnl > 0:
             self.wins += 1
@@ -498,7 +645,8 @@ class Engine:
             self.losses += 1
         rec = dict(
             t=str(p["t"]), t_open=str(p["t_open"]), t_close=str(ts),
-            entry=round(p["entry"], 2), exit=round(float(px), 2),
+            symbol=p.get("symbol", SYMBOL),  # v3
+            entry=rnd(p["entry"]), exit=rnd(px),  # v3: rotunjire adaptivă
             qty=round(p["qty"], 6), pnl=round(float(pnl), 4), why=why,
             equity_after=round(self.equity, 4),
         )
@@ -507,12 +655,12 @@ class Engine:
                 self.on_trade(rec)
             except Exception as e:
                 print("Eroare la logarea tranzacției:", e)
-        self.log(f"{ts} SELL @ {px:.2f} ({why}) PnL {pnl:+.2f} Equity {self.equity:.2f}")
+        self.log(f"{ts} SELL {rec['symbol']} @ {rnd(px)} ({why}) PnL {pnl:+.2f} Equity {self.equity:.2f}")
         self.pos = None
 
     def force_close(self, price, now):
         if self.pos is not None:
-            self._close(price * (1 - SLIPPAGE), "MANUAL", now)
+            self._close(price * (1 - self.pos.get("slip", SLIPPAGE)), "MANUAL", now)  # v3
 
 
 # ------------------------- BUCLA PRINCIPALĂ LIVE --------------------
@@ -542,8 +690,9 @@ def run_paper_loop():
             print("Poziție restaurată din MongoDB.")
 
     slot_unit = f"{BAR_MINUTES}min"
-    last_slot = None
-    print(f"\n--- [NOVA TRADE v2.3] Pornit cu capital {eng.equity:.2f}$ (MongoDB) ---", flush=True)
+    scanned = {}      # v3: piață -> ultima lumânare (slot) deja evaluată
+    scan_info = {}    # v3: rezultatul ultimei evaluări pe piață, pentru dashboard
+    print(f"\n--- [NOVA TRADE v3] Pornit cu capital {eng.equity:.2f}$ (MongoDB) ---", flush=True)
 
     while True:
         try:
@@ -551,10 +700,11 @@ def run_paper_loop():
             eng.cfg = cfg
             now = utc_now()
 
-            ticker = ex.fetch_ticker(SYMBOL)
-            price = fnum(ticker.get("last") or ticker.get("close"))
+            # v3: prețul se ia de pe piața poziției deschise (sau BTC când nu e nicio poziție)
+            cur_sym = eng.pos["symbol"] if eng.pos is not None else SYMBOL
+            price, price_ok = fetch_price(ex, cur_sym)
             if price <= 0:
-                raise ValueError("preț invalid de la exchange")
+                raise ValueError("preț invalid de la sursa de date")
 
             eng.roll_day(now.date())
 
@@ -562,26 +712,27 @@ def run_paper_loop():
             if cfg["close_now"]:
                 if eng.pos is not None:
                     eng.force_close(price, now)
-                    last_slot = now.floor(slot_unit)  # fără re-intrare imediată în aceeași lumânare
+                    for s in MARKETS:  # fără re-intrare imediată în aceeași lumânare
+                        scanned[s] = now.floor(slot_unit)
                 store.set_control(close_now=False)
 
             status = "HOLD"
             if eng.pos is not None:
-                _, status = eng.check_position_realtime(price, now)
+                if price_ok:
+                    _, status = eng.check_position_realtime(price, now)
+                else:
+                    status = "MARKET_CLOSED"  # v3: preț vechi, nu decidem pe el
             elif eng.trading_allowed():
                 slot = now.floor(slot_unit)
-                if slot != last_slot:
-                    ohlcv = ex.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=400)
-                    df = add_indicators(to_frame(ohlcv))
-                    closed = df.iloc[:-1].dropna().reset_index(drop=True)
-                    if len(closed) > 0:
-                        bar = closed.iloc[-1]
-                        # procesăm doar ultima lumânare închisă corectă; altfel reîncercăm
-                        if bar["ts"] == slot - pd.Timedelta(minutes=BAR_MINUTES):
-                            last_slot = slot
-                            fresh = (now - slot).total_seconds() <= MAX_SIGNAL_AGE
-                            if fresh and signal(bar):
-                                eng._open(bar, price)
+                if any(scanned.get(s) != slot for s in MARKETS):  # v3: scanner multi-piață
+                    best = scan_markets(ex, now, slot, scanned, scan_info)
+                    if best is not None:
+                        _, sym, bar = best
+                        px2, ok2 = fetch_price(ex, sym)
+                        if ok2 and px2 > 0:
+                            eng._open(bar, px2, sym)
+                            if eng.pos is not None:
+                                cur_sym, price = sym, px2
             elif cfg["stopped"]:
                 status = "STOPPED"
 
@@ -592,11 +743,12 @@ def run_paper_loop():
             if eng.pos is not None:
                 p = eng.pos
                 pos_dash = {
-                    "entry_price": round(p["entry"], 2),
+                    "symbol": p.get("symbol", SYMBOL),  # v3
+                    "entry_price": rnd(p["entry"]),
                     "margin": p.get("margin", 0.0),
                     "direction": "LONG",
-                    "target_tp": round(p["tp"], 2),
-                    "target_sl": round(p["stop"], 2),
+                    "target_tp": rnd(p["tp"]),
+                    "target_sl": rnd(p["stop"]),
                     "notional": round(p["qty"] * p["entry"], 2),
                     "bars": p["bars"],
                 }
@@ -606,7 +758,9 @@ def run_paper_loop():
                 "timestamp": now.strftime("%H:%M:%S"),
                 "capital": round(eng.equity, 2),
                 "equity": float(eng.equity),
-                "mid_price": round(price, 2),
+                "mid_price": rnd(price),
+                "price_symbol": cur_sym,  # v3
+                "scan": [f"{s}: {t}" for s, t in scan_info.items()],  # v3
                 "wins": eng.wins,
                 "losses": eng.losses,
                 "trades_count": eng.wins + eng.losses,

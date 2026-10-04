@@ -7,3 +7,4 @@ pymongo
 requests
 websockets
 python-dotenv
+yfinance

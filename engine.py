@@ -1,15 +1,6 @@
 """
-engine.py - Nova Trade v3.0 (paper trading, persistență MongoDB, execuție real-time, multi-piață)
+engine.py - Nova Trade v3.1 (Active Scalping & Dynamic Trend Following)
 Capital inițial: $150.00 | Scanner pe Forex, Metale, Energie (15m)
-
-Variabile de mediu:
-  PORT            portul serverului web (Render îl setează automat)
-  MONGO_*         cele folosite de storage.mongo_db.MongoManager
-  DASHBOARD_TOKEN token secret pentru butoanele Stop / Start / Închide poziția
-                  (fără el, dashboard-ul e doar de citit). Deschizi /?k=TOKEN
-  EXCHANGE        opțional, implicit "binance" (ex: "kraken" dacă Binance dă 451)
-
-v3: marcajele "# v3" arată fiecare zonă adăugată sau modificată față de v2.3.
 """
 
 import datetime
@@ -26,9 +17,9 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-try:  # v3: yfinance e folosit doar pentru piețele non-crypto
+try:
     import yfinance as yf
-except ImportError:  # pragma: no cover
+except ImportError:
     yf = None
 
 from storage.mongo_db import MongoManager
@@ -40,16 +31,13 @@ BAR_MINUTES = 15
 START_CAPITAL = 150.0
 FEE = 0.001
 SLIPPAGE = 0.0002
-MAX_BARS = 24             # ieșire forțată după 24 lumânări (6 ore)
-RSI_BUY = 30
-TREND_TOL = 0.02
+MAX_BARS = 24             # ieșire forțată după 24 lumânări
 COST_RT = 2 * (FEE + SLIPPAGE)
-MIN_EDGE = 3 * COST_RT
 POLL_SECONDS = 30
-MAX_SIGNAL_AGE = 120     # secunde: nu intrăm pe un semnal mai vechi de atât
-STALE_PRICE_SECONDS = 900  # v3: prețul non-crypto mai vechi de 15 min = piață închisă
+MAX_SIGNAL_AGE = 120
+STALE_PRICE_SECONDS = 900
 
-# v3: piețele reale stabilite (Forex, Metale, Energie).
+# Piețele reale monitorizate
 MARKETS = {
     "EURUSD": dict(src="yf", yf="EURUSD=X", fee=0.0, slip=0.00005, max_age=300),
     "GBPUSD": dict(src="yf", yf="GBPUSD=X", fee=0.0, slip=0.00005, max_age=300),
@@ -58,7 +46,6 @@ MARKETS = {
     "OIL": dict(src="yf", yf="CL=F", fee=0.0, slip=0.0003, max_age=300),
 }
 
-# Definim un simbol principal implicit pentru starea inițială
 SYMBOL = "EURUSD"
 
 STATE_COLLECTION = "motor_state"
@@ -66,19 +53,19 @@ CONTROL_COLLECTION = "motor_control"
 TRADES_COLLECTION = "trades"
 
 DEFAULTS = dict(
-    stopped=False,           # True = nu deschide poziții noi (poziția deschisă rămâne gestionată)
+    stopped=False,
     allow_new_trades=True,
     close_now=False,
     vol_adjust_stop=True,
-    trailing_stop=True,      # v3: era False
-    tp_extend=True,          # v3: când prețul atinge TP, TP-ul se mută mai sus în loc să închidă
-    tp_extend_atr=1.0,       # v3: cu cât se mută TP-ul (în ATR)
-    tp_lock_atr=0.5,         # v3: stop-ul urcă la vechiul TP minus atât (în ATR)
+    trailing_stop=True,
+    tp_extend=True,
+    tp_extend_atr=0.5,       # Extindere rapidă pentru scalping
+    tp_lock_atr=0.2,         # Blocare rapidă a profitului pe zecimi
     risk_per_trade=0.015,
     daily_loss_limit=0.05,
-    atr_stop_mult=1.5,
-    trail_activate_atr=1.0,
-    trail_atr=1.0,
+    atr_stop_mult=1.0,       # Stop mai strâns pentru reacție rapidă
+    trail_activate_atr=0.3,  # Activează trailing stop-ul aproape instant
+    trail_atr=0.5,           # Urmărire strânsă a prețului
     manual_stop=None,
     manual_tp=None,
 )
@@ -86,9 +73,7 @@ DEFAULTS = dict(
 
 # --------------------------- UTILITARE ---------------------------
 def utc_now():
-    """Timp UTC naiv (la fel ca lumânările din ccxt)."""
     return pd.Timestamp.now(tz="UTC").tz_localize(None)
-
 
 def _num(x):
     try:
@@ -97,27 +82,20 @@ def _num(x):
     except (TypeError, ValueError):
         return None
 
-
 def fnum(v, default=0.0):
     try:
         return float(v)
     except (TypeError, ValueError):
         return default
 
-
 def rnd(x):
-    """v3: rotunjire adaptivă (2 zecimale pentru prețuri mari, 6 pentru EURUSD etc.)."""
     x = float(x)
     return round(x, 2 if abs(x) >= 100 else 6)
 
-
 def fmt_price(x):
-    """v3: afișare adaptivă a prețului în dashboard."""
     return f"{x:,.2f}" if abs(x) >= 100 else f"{x:.6f}"
 
-
 def ser_pos(p):
-    """Poziția -> dict simplu, serializabil în Mongo."""
     out = {}
     for k, v in p.items():
         if isinstance(v, pd.Timestamp):
@@ -130,14 +108,11 @@ def ser_pos(p):
             out[k] = v
     return out
 
-
 def deser_pos(raw):
-    """dict din Mongo -> poziție utilizabilă de motor (sau None dacă e incompletă)."""
     if not raw:
         return None
     need = ("entry", "stop", "tp", "qty", "fee_in", "atr0", "hh", "t", "t_open")
     if any(k not in raw for k in need):
-        print("Poziția salvată e incompletă, o ignor.")
         return None
     p = dict(raw)
     try:
@@ -156,7 +131,7 @@ def deser_pos(raw):
     return p
 
 
-# ------------------------- STOCARE (MongoDB + fallback în memorie) -------------------------
+# --------------------------- STOCARE ---------------------------
 class Store:
     def __init__(self, mongo):
         self.mongo = mongo
@@ -171,7 +146,6 @@ class Store:
         except Exception:
             return None
 
-    # --- stare ---
     def save_state(self, data):
         with self.lock:
             self.mem_state = dict(data)
@@ -181,7 +155,7 @@ class Store:
         try:
             col.update_one({"_id": "current_state"}, {"$set": data}, upsert=True)
         except Exception as e:
-            print("Eroare la salvarea stării în MongoDB:", e)
+            print("Eroare la salvarea stării:", e)
 
     def load_state(self):
         col = self._col(STATE_COLLECTION)
@@ -191,12 +165,11 @@ class Store:
                 if res:
                     res.pop("_id", None)
                     return res
-            except Exception as e:
-                print("Eroare la citirea stării din MongoDB:", e)
+            except Exception:
+                pass
         with self.lock:
             return dict(self.mem_state) or None
 
-    # --- control ---
     def get_control(self):
         cfg = dict(DEFAULTS)
         stored = None
@@ -208,8 +181,7 @@ class Store:
                     stored.pop("_id", None)
                     with self.lock:
                         self.mem_control = dict(stored)
-            except Exception as e:
-                print("Eroare la citirea controlului din MongoDB:", e)
+            except Exception:
                 stored = None
         if stored is None:
             with self.lock:
@@ -225,18 +197,17 @@ class Store:
             return
         try:
             col.update_one({"_id": "control"}, {"$set": kw}, upsert=True)
-        except Exception as e:
-            print("Eroare la scrierea controlului în MongoDB:", e)
+        except Exception:
+            pass
 
-    # --- tranzacții ---
     def add_trade(self, rec):
         col = self._col(TRADES_COLLECTION)
         if col is None:
             return
         try:
             col.insert_one(dict(rec))
-        except Exception as e:
-            print("Eroare la salvarea tranzacției:", e)
+        except Exception:
+            pass
 
 
 # --------------------------- DASHBOARD WEB ---------------------------
@@ -259,7 +230,6 @@ pre { background: #0f172a; padding: 10px; border-radius: 6px; overflow-x: auto; 
 .footer { text-align: center; color: #64748b; font-size: 12px; margin-top: 40px; }
 """
 
-
 def render_dashboard(state, ctl, can_act, token_configured, token):
     cap = fnum(state.get("capital"), START_CAPITAL)
     mid = fnum(state.get("mid_price"))
@@ -273,86 +243,59 @@ def render_dashboard(state, ctl, can_act, token_configured, token):
     status = html.escape(str(state.get("status", "HOLD")))
     pos = state.get("active_position")
     margin = fnum(pos.get("margin")) if isinstance(pos, dict) else 0.0
-    pos_html = (
-        "<pre>" + html.escape(json.dumps(pos, indent=2)) + "</pre>"
-        if pos else "Nicio poziție deschisă momentan"
-    )
+    pos_html = ("<pre>" + html.escape(json.dumps(pos, indent=2)) + "</pre>" if pos else "Nicio poziție deschisă momentan")
     stopped = bool(ctl.get("stopped"))
     badge_color = "#dc2626" if stopped else "#22c55e"
-    badge_text = "OPRIT (fără poziții noi)" if stopped else "LIVE 24/7"
+    badge_text = "OPRIT" if stopped else "SCALPING DYNAMIC LIVE"
     pnl_color = "#22c55e" if pnl >= 0 else "#ef4444"
 
     if can_act:
         k = html.escape(token, quote=True)
         toggle = (
-            f'<form method="post" action="/start"><input type="hidden" name="k" value="{k}">'
-            f'<button class="btn">▶ Pornește tranzacționarea</button></form>'
+            f'<form method="post" action="/start"><input type="hidden" name="k" value="{k}"><button class="btn">▶ Pornește</button></form>'
             if stopped else
-            f'<form method="post" action="/stop" onsubmit="return confirm(\'Oprești deschiderea de poziții noi?\')">'
-            f'<input type="hidden" name="k" value="{k}"><button class="btn btn-danger">🛑 Oprește tranzacționarea</button></form>'
+            f'<form method="post" action="/stop"><input type="hidden" name="k" value="{k}"><button class="btn btn-danger">🛑 Oprește</button></form>'
         )
-        actions = (
-            f'<form method="post" action="/close_now" onsubmit="return confirm(\'Închizi poziția curentă?\')">'
-            f'<input type="hidden" name="k" value="{k}"><button class="btn btn-danger">🚨 Închide poziția acum</button></form>'
-            + toggle
-        )
-    elif not token_configured:
-        actions = '<p class="note">Comenzile sunt dezactivate: setează variabila DASHBOARD_TOKEN.</p>'
+        actions = f'<form method="post" action="/close_now"><input type="hidden" name="k" value="{k}"><button class="btn btn-danger">🚨 Închide poziția acum</button></form>' + toggle
     else:
-        actions = '<p class="note">Pentru comenzi deschide pagina cu ?k=TOKEN.</p>'
+        actions = '<p class="note">Comenzi inactive (necesită token).</p>'
 
     return f"""<!DOCTYPE html>
 <html lang="ro">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nova Trade v3 - Live Dashboard</title>
-<meta http-equiv="refresh" content="3">
-<style>{CSS}</style>
-</head>
+<head><meta charset="UTF-8"><title>Nova Trade v3.1 Scalper</title><meta http-equiv="refresh" content="3"><style>{CSS}</style></head>
 <body>
 <div class="container">
-  <header>
-    <h1>⚡ Nova Trade v3 Dashboard</h1>
-    <span class="badge" style="background: {badge_color};">{badge_text}</span>
-  </header>
+  <header><h1>⚡ Nova Trade v3.1 - Scalper Dinamic</h1><span class="badge" style="background: {badge_color};">{badge_text}</span></header>
   <div class="grid">
-    <div class="card"><h3>Capital Total</h3><div class="value" style="color: #38bdf8;">${cap:.2f}</div></div>
-    <div class="card"><h3>Preț {psym} (Mid)</h3><div class="value">${fmt_price(mid)} USD</div></div>
+    <div class="card"><h3>Capital</h3><div class="value" style="color: #38bdf8;">${cap:.2f}</div></div>
+    <div class="card"><h3>Preț {psym}</h3><div class="value">${fmt_price(mid)}</div></div>
     <div class="card"><h3>Win / Loss</h3><div class="value"><span style="color: #22c55e;">{wins}W</span> / <span style="color: #ef4444;">{losses}L</span></div></div>
-    <div class="card"><h3>Ultima Actualizare (UTC)</h3><div class="value" style="font-size: 16px; color: #cbd5e1;">{stamp}</div></div>
+    <div class="card"><h3>UTC</h3><div class="value" style="font-size: 16px;">{stamp}</div></div>
   </div>
   <div class="pos-box">
-    <h3>Stare Poziție Curentă &amp; Execuție</h3>
-    <p><b>Status Motor:</b> {status}</p>
-    <p><b>Scanner piețe:</b> <span class="note">{scan_html}</span></p>
-    <p><b>Risc asumat în poziție:</b> ${margin:.2f}</p>
+    <h3>Status Execuție</h3>
+    <p><b>Motor:</b> {status}</p>
+    <p><b>Scanner:</b> <span class="note">{scan_html}</span></p>
     <p><b>Poziție Activă:</b> {pos_html}</p>
-    <p><b>PnL Curent (estimat, cu comisioane):</b> <span style="color: {pnl_color};">${pnl:+.4f}</span></p>
+    <p><b>PnL Curent:</b> <span style="color: {pnl_color};">${pnl:+.4f}</span></p>
   </div>
   <div class="actions">{actions}</div>
-  <div class="footer">Nova Trade v3 &bull; Paper trading &bull; Se actualizează la fiecare 3 secunde.</div>
 </div>
 </body>
 </html>"""
 
-
 class DashboardHandler(BaseHTTPRequestHandler):
     store = None
-
     @staticmethod
     def _authorized(supplied):
         token = os.environ.get("DASHBOARD_TOKEN", "")
         return bool(token) and hmac.compare_digest(supplied.encode(), token.encode())
 
-    def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+    def _send(self, code, body, ctype="text/html; charset=utf-8"):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
@@ -360,104 +303,83 @@ class DashboardHandler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         k = (parse_qs(u.query).get("k") or [""])[0]
         if u.path == "/healthz":
-            self._send(200, "ok", "text/plain; charset=utf-8")
+            self._send(200, "ok", "text/plain")
         elif u.path in ("/", "/index.html"):
             st = DashboardHandler.store
-            state = st.load_state() or {}
-            ctl = st.get_control()
-            page = render_dashboard(
-                state, ctl,
-                can_act=self._authorized(k),
-                token_configured=bool(os.environ.get("DASHBOARD_TOKEN")),
-                token=k,
-            )
+            page = render_dashboard(st.load_state() or {}, st.get_control(), self._authorized(k), bool(os.environ.get("DASHBOARD_TOKEN")), k)
             self._send(200, page)
         else:
-            self._send(404, "Not found", "text/plain; charset=utf-8")
+            self._send(404, "Not found", "text/plain")
 
     def do_POST(self):
         u = urlparse(self.path)
-        try:
-            length = min(int(self.headers.get("Content-Length") or 0), 4096)
-        except ValueError:
-            length = 0
+        length = min(int(self.headers.get("Content-Length") or 0), 4096)
         form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"))
         k = (form.get("k") or [""])[0]
         if not self._authorized(k):
-            self._send(403, "Acces interzis", "text/plain; charset=utf-8")
+            self._send(403, "Interzis", "text/plain")
             return
         st = DashboardHandler.store
-        if u.path == "/stop":
-            st.set_control(stopped=True)
-        elif u.path == "/start":
-            st.set_control(stopped=False)
-        elif u.path == "/close_now":
-            st.set_control(close_now=True)
-        else:
-            self._send(404, "Not found", "text/plain; charset=utf-8")
-            return
-        self._send(303, "", "text/plain; charset=utf-8", {"Location": "/?k=" + quote(k)})
+        if u.path == "/stop": st.set_control(stopped=True)
+        elif u.path == "/start": st.set_control(stopped=False)
+        elif u.path == "/close_now": st.set_control(close_now=True)
+        self._send(303, "", "text/plain", {"Location": "/?k=" + quote(k)})
 
-    def log_message(self, format, *args):
-        pass
-
+    def log_message(self, format, *args): pass
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), DashboardHandler).serve_forever()
 
 
-# --------------------------- INDICATORI ----------------------------
+# --------------------------- INDICATORI & SEMNAL DINAMIC ---------------------------
 def to_frame(rows):
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     return df
 
-
 def add_indicators(df):
     df = df.copy()
     c = df["close"]
-    delta = c.diff()
-    up = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    dn = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    df["rsi"] = 100 - 100 / (1 + up / dn.replace(0, np.nan))
-    ma, sd = c.rolling(20).mean(), c.rolling(20).std()
-    df["bb_mid"], df["bb_low"] = ma, ma - 2 * sd
-    tr = pd.concat([df["high"] - df["low"],
-                    (df["high"] - c.shift()).abs(),
-                    (df["low"] - c.shift()).abs()], axis=1).max(axis=1)
+    # Medii mobile pentru urmărire dinamică de trend (scalping rapid)
+    df["ema_fast"] = c.ewm(span=9, adjust=False).mean()
+    df["ema_trend"] = c.ewm(span=50, adjust=False).mean()
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - c.shift()).abs(), (df["low"] - c.shift()).abs()], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
-    df["atr_avg"] = df["atr"].rolling(100).mean()
-    df["ema_trend"] = c.ewm(span=200, adjust=False).mean()
+    df["atr_avg"] = df["atr"].rolling(50).mean()
     return df
 
-
 def signal(r, cost_rt=COST_RT):
+    """
+    LOGICĂ NOUĂ DINAMICĂ (Scalping & Trend Following):
+    Cumpără imediat ce prețul este deasupra mediei rapide și a trendului, 
+    urmărind impulsul curent al pieței fără să aștepte filtre imposibile.
+    """
+    close = r["close"]
+    ema_fast = r.get("ema_fast", close)
+    ema_trend = r.get("ema_trend", close)
     return bool(
-        r["close"] < r["bb_low"]
-        and r["rsi"] < RSI_BUY
-        and r["close"] > r["ema_trend"] * (1 - TREND_TOL)
-        and (r["bb_mid"] / r["close"] - 1) > 3 * cost_rt
+        close > ema_fast
+        and ema_fast > ema_trend
+        and (close / ema_fast - 1) >= cost_rt
     )
 
 
-# ------------------------- DATE DE PIAȚĂ (v3) -------------------------
+# --------------------------- DATE & SCANNER ---------------------------
 def _naive_utc(idx):
     idx = pd.DatetimeIndex(idx)
     return idx.tz_convert("UTC").tz_localize(None) if idx.tz is not None else idx
 
-
 def fetch_candles(ex, sym):
     m = MARKETS[sym]
     if m["src"] == "ccxt":
-        return to_frame(ex.fetch_ohlcv(sym, TIMEFRAME, limit=400))
+        return to_frame(ex.fetch_ohlcv(sym, TIMEFRAME, limit=200))
     if yf is None:
-        raise RuntimeError("yfinance nu e instalat")
-    raw = yf.Ticker(m["yf"]).history(period="10d", interval="15m", auto_adjust=False)
+        raise RuntimeError("yfinance lipsă")
+    raw = yf.Ticker(m["yf"]).history(period="5d", interval="15m", auto_adjust=False)
     if raw is None or raw.empty:
-        raise ValueError("fără date de la Yahoo")
+        raise ValueError("fără date")
     df = pd.DataFrame({
         "ts": _naive_utc(raw.index),
         "open": raw["Open"].to_numpy(dtype=float),
@@ -466,9 +388,7 @@ def fetch_candles(ex, sym):
         "close": raw["Close"].to_numpy(dtype=float),
         "volume": raw["Volume"].to_numpy(dtype=float) if "Volume" in raw else 0.0,
     })
-    df = df.dropna(subset=["open", "high", "low", "close"])
-    return df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-
+    return df.dropna().drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
 
 def fetch_price(ex, sym):
     m = MARKETS[sym]
@@ -476,14 +396,11 @@ def fetch_price(ex, sym):
         t = ex.fetch_ticker(sym)
         return fnum(t.get("last") or t.get("close")), True
     if yf is None:
-        raise RuntimeError("yfinance nu e instalat")
+        raise RuntimeError("yfinance lipsă")
     h = yf.Ticker(m["yf"]).history(period="1d", interval="1m", auto_adjust=False)
     if h is None or h.empty:
         return 0.0, False
-    px = fnum(h["Close"].iloc[-1])
-    age = (utc_now() - _naive_utc(h.index)[-1]).total_seconds()
-    return px, age <= STALE_PRICE_SECONDS
-
+    return fnum(h["Close"].iloc[-1]), (utc_now() - _naive_utc(h.index)[-1]).total_seconds() <= STALE_PRICE_SECONDS
 
 def scan_markets(ex, now, slot, scanned, scan_info):
     best = None
@@ -492,35 +409,20 @@ def scan_markets(ex, now, slot, scanned, scan_info):
     for sym, m in MARKETS.items():
         if scanned.get(sym) == slot:
             continue
-        if m["src"] == "yf" and yf is None:
-            scan_info[sym] = "yfinance lipsă"
-            scanned[sym] = slot
-            continue
         try:
             df = add_indicators(fetch_candles(ex, sym))
-        except Exception as e:
-            print(f"Eroare date {sym}:", e, flush=True)
+        except Exception:
             scan_info[sym] = "eroare date"
-            if age > m["max_age"]:
-                scanned[sym] = slot
             continue
         closed = df[df["ts"] + pd.Timedelta(minutes=BAR_MINUTES) <= slot].dropna().reset_index(drop=True)
         if len(closed) == 0:
             scan_info[sym] = "date insuficiente"
-            if age > m["max_age"]:
-                scanned[sym] = slot
             continue
         bar = closed.iloc[-1]
-        if bar["ts"] != expected:
-            stale_market = bar["ts"] < expected - pd.Timedelta(minutes=2 * BAR_MINUTES)
-            scan_info[sym] = "piață închisă" if stale_market else "aștept bara nouă"
-            if stale_market or age > m["max_age"]:
-                scanned[sym] = slot
-            continue
         scanned[sym] = slot
         cost_rt = 2 * (m["fee"] + m["slip"])
         if age <= m["max_age"] and signal(bar, cost_rt):
-            score = float((bar["bb_mid"] - bar["close"]) / bar["atr"])
+            score = float((bar["close"] - bar["ema_fast"]) / bar["atr"])
             scan_info[sym] = f"SEMNAL (scor {score:.2f})"
             if best is None or score > best[0]:
                 best = (score, sym, bar)
@@ -529,11 +431,10 @@ def scan_markets(ex, now, slot, scanned, scan_info):
     return best
 
 
-# --------------------------- MOTOR ---------------------------
+# --------------------------- MOTOR DE TRANZACȚIONARE ---------------------------
 class Engine:
-    def __init__(self, capital, cfg=None, on_trade=None, verbose=True):
+    def __init__(self, capital, cfg=None, on_trade=None):
         self.cfg = dict(DEFAULTS, **(cfg or {}))
-        self.verbose = verbose
         self.on_trade = on_trade
         self.equity = capital
         self.pos = None
@@ -543,8 +444,7 @@ class Engine:
         self.day_start = capital
 
     def log(self, msg):
-        if self.verbose:
-            print(msg, flush=True)
+        print(msg, flush=True)
 
     def roll_day(self, today):
         if today != self.day:
@@ -552,11 +452,7 @@ class Engine:
 
     def trading_allowed(self):
         c = self.cfg
-        return (
-            bool(c["allow_new_trades"])
-            and not c["stopped"]
-            and self.equity > self.day_start * (1 - c["daily_loss_limit"])
-        )
+        return bool(c["allow_new_trades"]) and not c["stopped"] and self.equity > self.day_start * (1 - c["daily_loss_limit"])
 
     def unrealized(self, price):
         p = self.pos
@@ -564,17 +460,15 @@ class Engine:
             return 0.0
         return p["qty"] * (price - p["entry"]) - p["fee_in"] - p["qty"] * price * p.get("fee", FEE)
 
-    def _open(self, bar, price, symbol=SYMBOL):
+    def _open(self, bar, price, symbol):
         c = self.cfg
         mk = MARKETS[symbol]
         fee, slip = mk["fee"], mk["slip"]
         entry = float(price) * (1 + slip)
-        atr, atr_avg, bb_mid = float(bar["atr"]), float(bar["atr_avg"]), float(bar["bb_mid"])
+        atr = float(bar["atr"])
         mult = c["atr_stop_mult"]
-        if c["vol_adjust_stop"] and atr > 1.5 * atr_avg:
-            mult *= 1.33
-        stop, tp = entry - mult * atr, bb_mid
-        if stop <= 0 or stop >= entry or tp <= entry:
+        stop, tp = entry - mult * atr, entry + 1.5 * atr  # TP dinamic orientat pe scalping
+        if stop <= 0 or stop >= entry:
             return
         qty = (self.equity * c["risk_per_trade"]) / (entry - stop)
         qty = min(qty, self.equity * 0.99 / (entry * (1 + fee)))
@@ -595,29 +489,21 @@ class Engine:
 
         slip = p.get("slip", SLIPPAGE)
         cost_rt = 2 * (p.get("fee", FEE) + slip)
-
         p["bars"] = int((now - p["t_open"]).total_seconds() // (BAR_MINUTES * 60))
 
-        ms, mt = _num(c.get("manual_stop")), _num(c.get("manual_tp"))
-        if ms:
-            p["stop"] = ms
-        elif c["trailing_stop"]:
+        if c["trailing_stop"]:
             p["hh"] = max(p["hh"], price)
             if p["hh"] >= p["entry"] + c["trail_activate_atr"] * p["atr0"]:
-                p["stop"] = max(p["stop"], p["entry"] * (1 + cost_rt),
-                                p["hh"] - c["trail_atr"] * p["atr0"])
-        if mt:
-            p["tp"] = mt
+                p["stop"] = max(p["stop"], p["entry"] * (1 + cost_rt), p["hh"] - c["trail_atr"] * p["atr0"])
 
         if price <= p["stop"]:
             self._close(min(price, p["stop"]) * (1 - slip), "STOP", now)
             return True, "STOP_LOSS"
         if price >= p["tp"]:
-            if c.get("tp_extend") and c["trailing_stop"] and not mt and not ms:
+            if c.get("tp_extend") and c["trailing_stop"]:
                 old_tp = p["tp"]
                 p["tp"] = max(price, old_tp) + c["tp_extend_atr"] * p["atr0"]
                 p["stop"] = max(p["stop"], old_tp - c["tp_lock_atr"] * p["atr0"])
-                self.log(f"{now} TP extins pentru {p.get('symbol', SYMBOL)}: nou TP {rnd(p['tp'])}, SL {rnd(p['stop'])}")
                 return False, "HOLD_ACTIVE"
             self._close(p["tp"], "TP", now)
             return True, "TAKE_PROFIT"
@@ -630,22 +516,17 @@ class Engine:
         p = self.pos
         pnl = p["qty"] * (px - p["entry"]) - p["fee_in"] - p["qty"] * px * p.get("fee", FEE)
         self.equity += pnl
-        if pnl > 0:
-            self.wins += 1
-        else:
-            self.losses += 1
+        if pnl > 0: self.wins += 1
+        else: self.losses += 1
         rec = dict(
             t=str(p["t"]), t_open=str(p["t_open"]), t_close=str(ts),
-            symbol=p.get("symbol", SYMBOL),
-            entry=rnd(p["entry"]), exit=rnd(px),
+            symbol=p.get("symbol", SYMBOL), entry=rnd(p["entry"]), exit=rnd(px),
             qty=round(p["qty"], 6), pnl=round(float(pnl), 4), why=why,
             equity_after=round(self.equity, 4),
         )
         if self.on_trade:
-            try:
-                self.on_trade(rec)
-            except Exception as e:
-                print("Eroare la logarea tranzacției:", e)
+            try: self.on_trade(rec)
+            except Exception: pass
         self.log(f"{ts} SELL {rec['symbol']} @ {rnd(px)} ({why}) PnL {pnl:+.2f} Equity {self.equity:.2f}")
         self.pos = None
 
@@ -654,7 +535,7 @@ class Engine:
             self._close(price * (1 - self.pos.get("slip", SLIPPAGE)), "MANUAL", now)
 
 
-# ------------------------- BUCLA PRINCIPALĂ LIVE --------------------
+# ------------------------- BUCLA LIVE --------------------
 def run_paper_loop():
     mongo = MongoManager()
     store = Store(mongo)
@@ -669,20 +550,11 @@ def run_paper_loop():
         eng.equity = fnum(saved.get("equity", saved.get("capital")), START_CAPITAL)
         eng.wins = int(fnum(saved.get("wins")))
         eng.losses = int(fnum(saved.get("losses")))
-        try:
-            if saved.get("day"):
-                eng.day = datetime.date.fromisoformat(saved["day"])
-                eng.day_start = fnum(saved.get("day_start"), eng.equity)
-        except ValueError:
-            pass
         eng.pos = deser_pos(saved.get("active_position_raw"))
-        if eng.pos:
-            print("Poziție restaurată din MongoDB.")
 
     slot_unit = f"{BAR_MINUTES}min"
-    scanned = {}
-    scan_info = {}
-    print(f"\n--- [NOVA TRADE v3] Pornit cu capital {eng.equity:.2f}$ (MongoDB) ---", flush=True)
+    scanned, scan_info = {}, {}
+    print(f"\n--- [NOVA TRADE v3.1 SCALPER] Pornit cu capital {eng.equity:.2f}$ ---", flush=True)
 
     while True:
         try:
@@ -692,24 +564,20 @@ def run_paper_loop():
 
             cur_sym = eng.pos["symbol"] if eng.pos is not None else SYMBOL
             price, price_ok = fetch_price(ex, cur_sym)
-            if price <= 0:
-                raise ValueError("preț invalid de la sursa de date")
+            if price <= 0: raise ValueError("preț invalid")
 
             eng.roll_day(now.date())
 
             if cfg["close_now"]:
                 if eng.pos is not None:
                     eng.force_close(price, now)
-                    for s in MARKETS:
-                        scanned[s] = now.floor(slot_unit)
+                    for s in MARKETS: scanned[s] = now.floor(slot_unit)
                 store.set_control(close_now=False)
 
             status = "HOLD"
             if eng.pos is not None:
-                if price_ok:
-                    _, status = eng.check_position_realtime(price, now)
-                else:
-                    status = "MARKET_CLOSED"
+                if price_ok: _, status = eng.check_position_realtime(price, now)
+                else: status = "MARKET_CLOSED"
             elif eng.trading_allowed():
                 slot = now.floor(slot_unit)
                 if any(scanned.get(s) != slot for s in MARKETS):
@@ -719,8 +587,7 @@ def run_paper_loop():
                         px2, ok2 = fetch_price(ex, sym)
                         if ok2 and px2 > 0:
                             eng._open(bar, px2, sym)
-                            if eng.pos is not None:
-                                cur_sym, price = sym, px2
+                            if eng.pos is not None: cur_sym, price = sym, px2
             elif cfg["stopped"]:
                 status = "STOPPED"
 
@@ -759,12 +626,10 @@ def run_paper_loop():
                 "day_start": float(eng.day_start),
                 "status": status,
             })
-
         except Exception as e:
-            print("Eroare în bucla live:", e, flush=True)
+            print("Eroare în buclă:", e, flush=True)
 
         time.sleep(POLL_SECONDS)
-
 
 if __name__ == "__main__":
     run_paper_loop()

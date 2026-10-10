@@ -31,19 +31,19 @@ BAR_MINUTES = 15
 START_CAPITAL = 150.0
 FEE = 0.001
 SLIPPAGE = 0.0002
-MAX_BARS = 24             # ieșire forțată după 24 lumânări
+MAX_BARS = 48             # Extins la 48 lumânări (12 ore) pentru a nu tăia prematur trendurile valide
 COST_RT = 2 * (FEE + SLIPPAGE)
 POLL_SECONDS = 30
 MAX_SIGNAL_AGE = 120
 STALE_PRICE_SECONDS = 900
 
-# Piețele reale monitorizate
+# Piețele reale monitorizate (Corectat costurile reale: fee/slip realiste pentru a reflecta execuția)
 MARKETS = {
-    "EURUSD": dict(src="yf", yf="EURUSD=X", fee=0.0, slip=0.00005, max_age=300),
-    "GBPUSD": dict(src="yf", yf="GBPUSD=X", fee=0.0, slip=0.00005, max_age=300),
-    "USDJPY": dict(src="yf", yf="USDJPY=X", fee=0.0, slip=0.00005, max_age=300),
-    "GOLD": dict(src="yf", yf="GC=F", fee=0.0, slip=0.00015, max_age=300),
-    "OIL": dict(src="yf", yf="CL=F", fee=0.0, slip=0.0003, max_age=300),
+    "EURUSD": dict(src="yf", yf="EURUSD=X", fee=0.00005, slip=0.00005, max_age=300),
+    "GBPUSD": dict(src="yf", yf="GBPUSD=X", fee=0.00005, slip=0.00005, max_age=300),
+    "USDJPY": dict(src="yf", yf="USDJPY=X", fee=0.00005, slip=0.00005, max_age=300),
+    "GOLD": dict(src="yf", yf="GC=F", fee=0.0001, slip=0.00015, max_age=300),
+    "OIL": dict(src="yf", yf="CL=F", fee=0.0001, slip=0.0003, max_age=300),
 }
 
 SYMBOL = "EURUSD"
@@ -58,14 +58,16 @@ DEFAULTS = dict(
     close_now=False,
     vol_adjust_stop=True,
     trailing_stop=True,
-    tp_extend=True,
-    tp_extend_atr=0.5,       # Extindere rapidă pentru scalping
-    tp_lock_atr=0.2,         # Blocare rapidă a profitului pe zecimi
+    tp_extend=False,         # Dezactivat implicit pentru a lăsa TP-ul fix să își atingă ținta fără override prematur
+    tp_extend_atr=0.5,       
+    tp_lock_atr=0.2,         
     risk_per_trade=0.015,
+    trade_amount=50.0,       # plafon noțional în USD pentru o poziție simulată
     daily_loss_limit=0.05,
-    atr_stop_mult=1.0,       # Stop mai strâns pentru reacție rapidă
-    trail_activate_atr=0.3,  # Activează trailing stop-ul aproape instant
-    trail_atr=0.5,           # Urmărire strânsă a prețului
+    capital_override=None,
+    atr_stop_mult=1.2,       # Stop puțin mai larg (1.2 ATR) pentru a evita zgomotul de piață pe 15m
+    trail_activate_atr=0.6,  # Activează trailing-ul mai târziu (la 0.6 ATR) ca să lase spațiu mișcării
+    trail_atr=0.8,           # Urmărire mai relaxată (0.8 ATR) împotriva ieșirilor premature în consolidare
     manual_stop=None,
     manual_tp=None,
 )
@@ -94,6 +96,12 @@ def rnd(x):
 
 def fmt_price(x):
     return f"{x:,.2f}" if abs(x) >= 100 else f"{x:.6f}"
+
+def quote_to_usd(symbol, amount, price):
+    return amount / price if symbol == "USDJPY" and price > 0 else amount
+
+def usd_notional(symbol, qty, price):
+    return qty if symbol == "USDJPY" else qty * price
 
 def ser_pos(p):
     out = {}
@@ -138,6 +146,7 @@ class Store:
         self.lock = threading.Lock()
         self.mem_state = {}
         self.mem_control = {}
+        self.mem_trades = []
 
     def _col(self, name):
         try:
@@ -201,6 +210,9 @@ class Store:
             pass
 
     def add_trade(self, rec):
+        with self.lock:
+            self.mem_trades.insert(0, dict(rec))
+            self.mem_trades = self.mem_trades[:100]
         col = self._col(TRADES_COLLECTION)
         if col is None:
             return
@@ -208,6 +220,20 @@ class Store:
             col.insert_one(dict(rec))
         except Exception:
             pass
+
+    def recent_trades(self, limit=20):
+        col = self._col(TRADES_COLLECTION)
+        if col is None:
+            with self.lock:
+                return list(self.mem_trades[:limit])
+        try:
+            rows = list(col.find({}).sort("t_close", -1).limit(limit))
+            for row in rows:
+                row.pop("_id", None)
+            return rows
+        except Exception:
+            with self.lock:
+                return list(self.mem_trades[:limit])
 
 
 # --------------------------- DASHBOARD WEB ---------------------------
@@ -228,9 +254,22 @@ pre { background: #0f172a; padding: 10px; border-radius: 6px; overflow-x: auto; 
 .btn-danger { background: #dc2626; }
 .note { color: #94a3b8; font-size: 13px; }
 .footer { text-align: center; color: #64748b; font-size: 12px; margin-top: 40px; }
+.settings { display: flex; gap: 14px; align-items: end; flex-wrap: wrap; }
+.settings label { display: grid; gap: 6px; color: #cbd5e1; font-size: 13px; }
+.settings input { background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 5px; padding: 9px; width: 190px; }
+.position-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.position-grid div { background: #0f172a; border-radius: 6px; padding: 10px; }
+.position-grid span, .position-grid b { display: block; }
+.position-grid span { color: #94a3b8; font-size: 12px; margin-bottom: 5px; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { border-bottom: 1px solid #334155; padding: 9px; text-align: left; white-space: nowrap; }
+th { color: #94a3b8; }
+button:disabled { opacity: .5; cursor: not-allowed; }
 """
 
-def render_dashboard(state, ctl, can_act, token_configured, token):
+def render_dashboard(state, ctl, can_act, token_configured, token, history=None):
+    history = history or []
     cap = fnum(state.get("capital"), START_CAPITAL)
     mid = fnum(state.get("mid_price"))
     psym = html.escape(str(state.get("price_symbol") or SYMBOL))
@@ -243,10 +282,16 @@ def render_dashboard(state, ctl, can_act, token_configured, token):
     status = html.escape(str(state.get("status", "HOLD")))
     pos = state.get("active_position")
     margin = fnum(pos.get("margin")) if isinstance(pos, dict) else 0.0
-    pos_html = ("<pre>" + html.escape(json.dumps(pos, indent=2)) + "</pre>" if pos else "Nicio poziție deschisă momentan")
+    if pos:
+        pos_html = "<div class=\"position-grid\">" + "".join(
+            f"<div><span>{label}</span><b>{html.escape(str(pos.get(key, '—')))}</b></div>"
+            for label, key in (("Instrument", "symbol"), ("Direcție", "direction"), ("Intrare", "entry_price"), ("Cantitate", "qty"), ("Valoare poziție", "notional"), ("Stop-loss", "target_sl"), ("Take-profit", "target_tp"), ("Lumânări", "bars"))
+        ) + "</div>"
+    else:
+        pos_html = "Nicio poziție deschisă momentan"
     stopped = bool(ctl.get("stopped"))
     badge_color = "#dc2626" if stopped else "#22c55e"
-    badge_text = "OPRIT" if stopped else "SCALPING DYNAMIC LIVE"
+    badge_text = "OPRIT" if stopped else "SIMULARE PAPER"
     pnl_color = "#22c55e" if pnl >= 0 else "#ef4444"
 
     if can_act:
@@ -257,8 +302,27 @@ def render_dashboard(state, ctl, can_act, token_configured, token):
             f'<form method="post" action="/stop"><input type="hidden" name="k" value="{k}"><button class="btn btn-danger">🛑 Oprește</button></form>'
         )
         actions = f'<form method="post" action="/close_now"><input type="hidden" name="k" value="{k}"><button class="btn btn-danger">🚨 Închide poziția acum</button></form>' + toggle
+        settings = f'''<section class="card"><h3>Setări simulare</h3>
+          <form method="post" action="/settings" class="settings">
+            <input type="hidden" name="k" value="{k}">
+            <label>Valoare maximă poziție (USD)
+              <input type="number" name="trade_amount" min="1" step="1" value="{fnum(ctl.get('trade_amount'), 50):.2f}" required>
+            </label>
+            <label>Capital simulării (USD){' — disponibilă fără poziție deschisă' if pos else ''}
+              <input type="number" name="capital" min="1" step="0.01" value="{cap:.2f}" {'disabled' if pos else ''}>
+            </label>
+            <button class="btn">Salvează setările</button>
+          </form>
+          <p class="note">Riscul la stop rămâne controlat separat de setarea existentă de 1,5% din capital. Poziția nu va depăși nici plafonul de mai sus, nici capitalul disponibil.</p>
+        </section>'''
     else:
         actions = '<p class="note">Comenzi inactive (necesită token).</p>'
+        settings = '<p class="note">Setările simulării necesită token.</p>'
+
+    history_rows = "".join(
+        "<tr>" + "".join(f"<td>{html.escape(str(row.get(key, '')))}</td>" for key in ("t_close", "symbol", "entry", "exit", "qty", "pnl", "why")) + "</tr>"
+        for row in history
+    ) or '<tr><td colspan="7">Nu există tranzacții închise salvate.</td></tr>'
 
     return f"""<!DOCTYPE html>
 <html lang="ro">
@@ -279,7 +343,12 @@ def render_dashboard(state, ctl, can_act, token_configured, token):
     <p><b>Poziție Activă:</b> {pos_html}</p>
     <p><b>PnL Curent:</b> <span style="color: {pnl_color};">${pnl:+.4f}</span></p>
   </div>
+  {settings}
   <div class="actions">{actions}</div>
+  <div class="pos-box"><h3>Istoric tranzacții închise (ultimele 20)</h3>
+    <div class="table-wrap"><table><thead><tr><th>Închisă la</th><th>Simbol</th><th>Intrare</th><th>Ieșire</th><th>Cantitate</th><th>PnL net</th><th>Motiv</th></tr></thead>
+    <tbody>{history_rows}</tbody></table></div>
+  </div>
 </div>
 </body>
 </html>"""
@@ -291,11 +360,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         token = os.environ.get("DASHBOARD_TOKEN", "")
         return bool(token) and hmac.compare_digest(supplied.encode(), token.encode())
 
-    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+    def _send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -306,7 +377,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send(200, "ok", "text/plain")
         elif u.path in ("/", "/index.html"):
             st = DashboardHandler.store
-            page = render_dashboard(st.load_state() or {}, st.get_control(), self._authorized(k), bool(os.environ.get("DASHBOARD_TOKEN")), k)
+            page = render_dashboard(st.load_state() or {}, st.get_control(), self._authorized(k), bool(os.environ.get("DASHBOARD_TOKEN")), k, st.recent_trades())
             self._send(200, page)
         else:
             self._send(404, "Not found", "text/plain")
@@ -323,6 +394,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if u.path == "/stop": st.set_control(stopped=True)
         elif u.path == "/start": st.set_control(stopped=False)
         elif u.path == "/close_now": st.set_control(close_now=True)
+        elif u.path == "/settings":
+            try:
+                amount = float((form.get("trade_amount") or [""])[0])
+                if not 1 <= amount <= 1_000_000:
+                    raise ValueError
+                capital_text = (form.get("capital") or [""])[0].strip()
+                capital = None
+                if capital_text:
+                    current = st.load_state() or {}
+                    if current.get("active_position"):
+                        self._send(409, "Capitalul nu poate fi schimbat cât timp există o poziție deschisă.", "text/plain")
+                        return
+                    capital = float(capital_text)
+                    if not 1 <= capital <= 100_000_000:
+                        raise ValueError
+                updates = {"trade_amount": amount}
+                if capital is not None:
+                    updates["capital_override"] = capital
+                st.set_control(**updates)
+            except (ValueError, TypeError):
+                self._send(400, "Valori invalide. Introdu sume pozitive în limitele afișate.", "text/plain")
+                return
         self._send(303, "", "text/plain", {"Location": "/?k=" + quote(k)})
 
     def log_message(self, format, *args): pass
@@ -342,26 +435,22 @@ def to_frame(rows):
 def add_indicators(df):
     df = df.copy()
     c = df["close"]
-    # Medii mobile pentru urmărire dinamică de trend (scalping rapid)
     df["ema_fast"] = c.ewm(span=9, adjust=False).mean()
     df["ema_trend"] = c.ewm(span=50, adjust=False).mean()
     tr = pd.concat([df["high"] - df["low"], (df["high"] - c.shift()).abs(), (df["low"] - c.shift()).abs()], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
     df["atr_avg"] = df["atr"].rolling(50).mean()
+    df["breakout_high"] = df["high"].rolling(20).max().shift(1)
     return df
 
 def signal(r, cost_rt=COST_RT):
-    """
-    LOGICĂ NOUĂ DINAMICĂ (Scalping & Trend Following):
-    Cumpără imediat ce prețul este deasupra mediei rapide și a trendului, 
-    urmărind impulsul curent al pieței fără să aștepte filtre imposibile.
-    """
     close = r["close"]
     ema_fast = r.get("ema_fast", close)
     ema_trend = r.get("ema_trend", close)
     return bool(
         close > ema_fast
         and ema_fast > ema_trend
+        and close > r.get("breakout_high", float("inf"))
         and (close / ema_fast - 1) >= cost_rt
     )
 
@@ -405,7 +494,6 @@ def fetch_price(ex, sym):
 def scan_markets(ex, now, slot, scanned, scan_info):
     best = None
     age = (now - slot).total_seconds()
-    expected = slot - pd.Timedelta(minutes=BAR_MINUTES)
     for sym, m in MARKETS.items():
         if scanned.get(sym) == slot:
             continue
@@ -458,7 +546,10 @@ class Engine:
         p = self.pos
         if p is None:
             return 0.0
-        return p["qty"] * (price - p["entry"]) - p["fee_in"] - p["qty"] * price * p.get("fee", FEE)
+        symbol = p.get("symbol", SYMBOL)
+        gross = quote_to_usd(symbol, p["qty"] * (price - p["entry"]), price)
+        fee_out = quote_to_usd(symbol, p["qty"] * price * p.get("fee", FEE), price)
+        return gross - p["fee_in"] - fee_out
 
     def _open(self, bar, price, symbol):
         c = self.cfg
@@ -467,16 +558,20 @@ class Engine:
         entry = float(price) * (1 + slip)
         atr = float(bar["atr"])
         mult = c["atr_stop_mult"]
-        stop, tp = entry - mult * atr, entry + 1.5 * atr  # TP dinamic orientat pe scalping
+        stop, tp = entry - mult * atr, entry + 1.5 * atr  
         if stop <= 0 or stop >= entry:
             return
-        qty = (self.equity * c["risk_per_trade"]) / (entry - stop)
-        qty = min(qty, self.equity * 0.99 / (entry * (1 + fee)))
+        risk_budget = self.equity * c["risk_per_trade"]
+        risk_per_unit = quote_to_usd(symbol, entry - stop, entry)
+        amount_denominator = 1.0 if symbol == "USDJPY" else entry
+        capital_denominator = (1 + fee) if symbol == "USDJPY" else entry * (1 + fee)
+        qty = risk_budget / risk_per_unit
+        qty = min(qty, c.get("trade_amount", 50.0) / amount_denominator, self.equity * 0.99 / capital_denominator)
         if qty <= 0:
             return
         self.pos = dict(
             entry=entry, stop=stop, tp=tp, qty=float(qty), bars=0, hh=entry,
-            atr0=atr, fee_in=float(qty * entry * fee), t=bar["ts"],
+            atr0=atr, fee_in=float(quote_to_usd(symbol, qty * entry * fee, entry)), t=bar["ts"],
             t_open=utc_now(), margin=round(self.equity * c["risk_per_trade"], 2),
             symbol=symbol, fee=fee, slip=slip,
         )
@@ -514,7 +609,10 @@ class Engine:
 
     def _close(self, px, why, ts):
         p = self.pos
-        pnl = p["qty"] * (px - p["entry"]) - p["fee_in"] - p["qty"] * px * p.get("fee", FEE)
+        symbol = p.get("symbol", SYMBOL)
+        gross = quote_to_usd(symbol, p["qty"] * (px - p["entry"]), px)
+        fee_out = quote_to_usd(symbol, p["qty"] * px * p.get("fee", FEE), px)
+        pnl = gross - p["fee_in"] - fee_out
         self.equity += pnl
         if pnl > 0: self.wins += 1
         else: self.losses += 1
@@ -559,6 +657,13 @@ def run_paper_loop():
     while True:
         try:
             cfg = store.get_control()
+            if cfg.get("capital_override") is not None and eng.pos is None:
+                new_capital = fnum(cfg.get("capital_override"))
+                if new_capital >= 1:
+                    eng.equity = new_capital
+                    eng.day_start = new_capital
+                store.set_control(capital_override=None)
+                cfg["capital_override"] = None
             eng.cfg = cfg
             now = utc_now()
 
@@ -600,11 +705,12 @@ def run_paper_loop():
                 pos_dash = {
                     "symbol": p.get("symbol", SYMBOL),
                     "entry_price": rnd(p["entry"]),
+                    "qty": round(p["qty"], 6),
                     "margin": p.get("margin", 0.0),
                     "direction": "LONG",
                     "target_tp": rnd(p["tp"]),
                     "target_sl": rnd(p["stop"]),
-                    "notional": round(p["qty"] * p["entry"], 2),
+                    "notional": round(usd_notional(p.get("symbol", SYMBOL), p["qty"], p["entry"]), 2),
                     "bars": p["bars"],
                 }
                 raw_pos = ser_pos(p)

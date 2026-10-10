@@ -1,4 +1,3 @@
- a
 """
 engine.py - Nova Trade v3.1 (Active Scalping & Dynamic Trend Following)
 Capital inițial: $150.00 | Scanner pe Forex, Metale, Energie și Crypto (24/7)

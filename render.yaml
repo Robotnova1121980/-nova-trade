@@ -8,13 +8,46 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "streamlit run dashboard.py --server.port $PORT --server.address 0.0.0.0"
     autoDeploy: true
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      - key: DASHBOARD_TOKEN
+        sync: false
+      - key: CAPITAL_DEMO_EPICS
+        value: EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURJPY,GBPJPY,US500,US100,US30,DE40,UK100,GOLD,SILVER,OIL_CRUDE,OIL_BRENT,BTCUSD,ETHUSD
+      - key: CAPITAL_DEMO_ENABLE_ORDERS
+        value: "true"
 
-  # 2. Motorul de Trading (transformat în web service gratuit pentru a rula stabil)
+  # 2. Singurul motor de tranzacționare: Capital.com Demo.
   - type: web
     name: nova-trade-engine
     env: python
     region: frankfurt
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python engine.py"
+    startCommand: "python capital_demo_runner.py"
+    healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      - key: CAPITAL_DEMO_IDENTIFIER
+        sync: false
+      - key: CAPITAL_DEMO_API_KEY
+        sync: false
+      - key: CAPITAL_DEMO_API_PASSWORD
+        sync: false
+      - key: CAPITAL_DEMO_EPICS
+        value: EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURJPY,GBPJPY,US500,US100,US30,DE40,UK100,GOLD,SILVER,OIL_CRUDE,OIL_BRENT,BTCUSD,ETHUSD
+      - key: CAPITAL_DEMO_ENABLE_ORDERS
+        value: "true"
+      - key: CAPITAL_DEMO_REQUIRE_MONGO
+        value: "true"
+      - key: CAPITAL_DEMO_MAX_OPEN_POSITIONS
+        value: "3"
+      - key: CAPITAL_DEMO_RISK_PERCENT
+        value: "0.5"
+      - key: CAPITAL_DEMO_BAR_MINUTES
+        value: "5"
+      - key: CAPITAL_DEMO_POLL_SECONDS
+        value: "15"

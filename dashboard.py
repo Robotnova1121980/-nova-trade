@@ -1,144 +1,137 @@
-"""
-dashboard.py
-Terminal de Trading & Monitorizare - Sincronizat cu Capital de 50$
-"""
+"""Mongo-backed control panel for the single Capital.com Demo runner."""
 
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import time
-import json
+from __future__ import annotations
+
 import os
+import time
+import hmac
+from datetime import datetime, timezone
+
+import pandas as pd
+import streamlit as st
+
 from storage.mongo_db import MongoManager
 
-st.set_page_config(
-    page_title="Nova Trade v0.5 - Live Terminal ($50)",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="Nova Trade — Capital Demo", page_icon="📈", layout="wide")
+st.title("Nova Trade — Capital.com Demo")
+st.caption("Un singur runner Capital.com Demo; setările și starea sunt păstrate în MongoDB.")
 
-st.title("📈 Nova Trade v0.5 — Test Capital $50 & Sincronizare Reală")
-
-st.sidebar.header("🎛️ Control Live")
-auto_refresh = st.sidebar.checkbox("Reîmprospătare Automată (1s)", value=True)
+dashboard_token = os.getenv("DASHBOARD_TOKEN", "")
+if not dashboard_token:
+    st.error("DASHBOARD_TOKEN lipsește din variabilele private Render; panoul este blocat.")
+    st.stop()
+if not st.session_state.get("dashboard_authenticated"):
+    with st.form("dashboard_login"):
+        supplied_token = st.text_input("Parola panoului", type="password")
+        login_clicked = st.form_submit_button("Autentificare")
+    if login_clicked and hmac.compare_digest(supplied_token, dashboard_token):
+        st.session_state["dashboard_authenticated"] = True
+        st.rerun()
+    st.info("Introdu parola privată a panoului.")
+    st.stop()
 
 @st.cache_resource
-def init_db():
-    return MongoManager()
+def get_db():
+    manager = MongoManager()
+    manager.client.admin.command("ping")
+    return manager
 
-db = init_db()
-
-# Citire stare live generată de motor
-state_file = "motor_state.json"
-engine_data = {}
-
-if os.path.exists(state_file):
-    try:
-        with open(state_file, "r") as f:
-            engine_data = json.load(f)
-    except Exception:
-        pass
-
-real_capital = engine_data.get("capital", 50.0)
-current_price = engine_data.get("mid_price", 84904.01)
-wins = engine_data.get("wins", 0)
-losses = engine_data.get("losses", 0)
-active_pos = engine_data.get("active_position", None)
-current_pnl = engine_data.get("current_pnl", 0.0)
-status_motor = engine_data.get("status", "HOLD_ACTIVE")
-last_time = engine_data.get("timestamp", "--:--:--")
-
-# Preluare evenimente din MongoDB pentru istoric
 try:
-    cursor_events = db.events_coll.find({}, {"_id": 0}).sort("timestamp", -1).limit(15)
-    events_list = list(cursor_events)
-except Exception:
-    events_list = []
+    mongo = get_db()
+    control_collection = mongo.db["motor_control"]
+    runner_collection = mongo.db["capital_demo_state"]
+    event_collection = mongo.db["capital_demo_events"]
+    control = control_collection.find_one({"_id": "control"}) or {}
+    state = runner_collection.find_one({"_id": "runner"}) or {}
+except Exception as exc:
+    st.error(f"Nu pot citi MongoDB. Verifică MONGO_URI în Render. Detaliu: {exc}")
+    st.stop()
 
-# Metrice principale sus
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Capital Real Motor", f"${real_capital:,.4f}", "Start Test: $50.00")
-c2.metric(f"Preț Live BTC ({last_time})", f"${current_price:,.2f}", f"W/L: {wins}W / {losses}L")
-c3.metric("Stare Poziție", active_pos.get("direction", "NONE") if active_pos else "FĂRĂ POZIȚIE", f"Status: {status_motor}")
-c4.metric("PnL Curent Live", f"${current_pnl:+.4f}", "Sincronizat 100%")
+default_epics = os.getenv(
+    "CAPITAL_DEMO_EPICS",
+    "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURJPY,GBPJPY,US500,US100,US30,DE40,UK100,GOLD,SILVER,OIL_CRUDE,OIL_BRENT,BTCUSD,ETHUSD",
+)
+with st.sidebar.form("capital_demo_control"):
+    st.header("Setări bot Demo")
+    allow_entries = st.checkbox(
+        "Permite intrări noi",
+        value=bool(control.get("allow_new_trades", True)) and not bool(control.get("stopped", False)),
+    )
+    orders_enabled = st.checkbox(
+        "Trimite ordine pe contul Demo",
+        value=bool(control.get("capital_demo_enable_orders", os.getenv("CAPITAL_DEMO_ENABLE_ORDERS", "false").lower() == "true")),
+    )
+    risk_percent = st.number_input(
+        "Risc estimat per ordin (%)", min_value=0.05, max_value=5.0, step=0.05,
+        value=float(control.get("capital_demo_risk_percent", os.getenv("CAPITAL_DEMO_RISK_PERCENT", "0.5"))),
+    )
+    max_positions = st.selectbox(
+        "Poziții simultane, pe piețe diferite", options=[1, 2, 3],
+        index=max(0, min(2, int(control.get("capital_demo_max_open_positions", 3)) - 1)),
+    )
+    bar_minutes = st.selectbox(
+        "Interval lumânare (minute)", options=[5, 15],
+        index=0 if int(control.get("capital_demo_bar_minutes", 5)) == 5 else 1,
+    )
+    epics_text = st.text_area(
+        "Piețe Capital (epic-uri separate prin virgulă)",
+        value=str(control.get("capital_demo_epics", default_epics)), height=100,
+    )
+    save_settings = st.form_submit_button("Salvează setările")
 
-st.markdown("---")
+if save_settings:
+    epics = list(dict.fromkeys(epic.strip() for epic in epics_text.split(",") if epic.strip()))
+    if not epics:
+        st.sidebar.error("Adaugă cel puțin un epic Capital valid.")
+    else:
+        control_collection.update_one(
+            {"_id": "control"},
+            {"$set": {
+                "allow_new_trades": allow_entries,
+                "stopped": not allow_entries,
+                "capital_demo_enable_orders": orders_enabled,
+                "capital_demo_risk_percent": float(risk_percent),
+                "capital_demo_max_open_positions": int(max_positions),
+                "capital_demo_bar_minutes": int(bar_minutes),
+                "capital_demo_epics": epics,
+            }},
+            upsert=True,
+        )
+        st.sidebar.success("Setările au fost salvate în MongoDB; runnerul le preia la următoarea verificare.")
+        st.rerun()
 
-# ==========================================================
-# GRAFIC REAL BAZAT PE PREȚUL LIVE DIN MOTOR
-# ==========================================================
-st.subheader("📊 Grafic Preț Live & Niveluri Strategice (BTCUSDT)")
-
-import datetime
-now_time = datetime.datetime.now()
-
-df_live_chart = pd.DataFrame([
-    {"time": now_time - datetime.timedelta(seconds=20), "price": current_price - 15},
-    {"time": now_time - datetime.timedelta(seconds=15), "price": current_price - 8},
-    {"time": now_time - datetime.timedelta(seconds=10), "price": current_price + 5},
-    {"time": now_time - datetime.timedelta(seconds=5), "price": current_price - 3},
-    {"time": now_time, "price": current_price}
-])
-
-fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=df_live_chart['time'], 
-    y=df_live_chart['price'],
-    mode='lines+markers',
-    name='Preț Live BTC',
-    line=dict(color='#29B6F6', width=3)
-))
-
-if active_pos:
-    entry_p = active_pos.get("entry_price", current_price)
-    sl_p = active_pos.get("target_sl", current_price * 0.999)
-    tp_p = active_pos.get("target_tp", current_price * 1.001)
-    pos_dir = active_pos.get("direction", "LONG")
+status = str(state.get("status", "waiting"))
+updated = state.get("updated_at")
+if isinstance(updated, datetime):
+    updated_text = updated.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 else:
-    entry_p = current_price
-    sl_p = current_price * 0.999
-    tp_p = current_price * 1.001
-    pos_dir = "SEARCHING"
+    updated_text = "încă nu există heartbeat"
+scanned = state.get("scanned_bars") or {}
 
-fig.add_hline(y=entry_p, line_dash="dash", line_color="orange", annotation_text=f"ENTRY: ${entry_p:,.2f}")
-fig.add_hline(y=sl_p, line_dash="dot", line_color="red", annotation_text=f"STOP LOSS: ${sl_p:,.2f}")
-fig.add_hline(y=tp_p, line_dash="dot", line_color="green", annotation_text=f"TAKE PROFIT: ${tp_p:,.2f}")
+col1, col2, col3 = st.columns(3)
+col1.metric("Starea runnerului", status)
+col2.metric("Ultimul heartbeat", updated_text)
+col3.metric("Piețe cu lumânare procesată", len(scanned))
 
-fig.update_layout(
-    height=400,
-    margin=dict(l=20, r=20, t=30, b=20),
-    paper_bgcolor='rgba(0,0,0,0)',
-    plot_bgcolor='rgba(15,15,25,0.9)',
-    xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)'),
-    yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
+st.subheader("Setarea curentă")
+st.write(
+    f"Ordine Demo: **{'activate' if control.get('capital_demo_enable_orders', os.getenv('CAPITAL_DEMO_ENABLE_ORDERS', 'false').lower() == 'true') else 'dezactivate'}** · "
+    f"Intrări noi: **{'permise' if control.get('allow_new_trades', True) and not control.get('stopped', False) else 'oprite'}** · "
+    f"Limită: **{control.get('capital_demo_max_open_positions', 3)} poziții** · "
+    f"Lumânări: **{control.get('capital_demo_bar_minutes', 5)} minute** · "
+    f"Risc: **{control.get('capital_demo_risk_percent', 0.5)}% per ordin**"
 )
 
-st.plotly_chart(fig, use_container_width=True)
+st.subheader("Ultimele semnale și ordine confirmate")
+try:
+    events = list(event_collection.find({}, {"_id": 0}).sort("timestamp", -1).limit(30))
+except Exception:
+    events = []
+if events:
+    st.dataframe(pd.DataFrame(events), use_container_width=True, hide_index=True)
+else:
+    st.info("Nu există încă semnale sau ordine înregistrate de runner.")
 
-st.markdown("---")
-
-col_l, col_r = st.columns(2)
-
-with col_l:
-    st.subheader("🎯 Stare Execuție Curentă")
-    if active_pos:
-        st.success(f"Poziție activă în desfășurare: {pos_dir}")
-        st.write(f"- **Direcție:** `{pos_dir}`")
-        st.write(f"- **Preț Intrare:** `${entry_p:,.2f}`")
-        st.write(f"- **Stop Loss Configurat:** `${sl_p:,.2f}`")
-        st.write(f"- **Take Profit Configurat:** `${tp_p:,.2f}`")
-        st.write(f"- **PnL Curent în Timp Real:** `${current_pnl:+.4f}`")
-    else:
-        st.info("Motorul scanează piața cu $50 capital. Nicio poziție deschisă momentan.")
-
-with col_r:
-    st.subheader("📋 Ultimele Evenimente din MongoDB")
-    if events_list:
-        df_events = pd.DataFrame(events_list)
-        st.dataframe(df_events, use_container_width=True)
-    else:
-        st.info("Se așteaptă înregistrarea evenimentelor...")
-
-if auto_refresh:
-    time.sleep(1)
+if st.checkbox("Reîmprospătează automat la fiecare 15 secunde", value=True):
+    time.sleep(15)
     st.rerun()

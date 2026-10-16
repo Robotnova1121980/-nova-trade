@@ -1,9 +1,10 @@
 """
-engine.py - Nova Trade v3.1 (Active Scalping & Dynamic Trend Following)
+engine.py - Nova Trade v3.1 (15-minute Breakout & Trend Following)
 Capital inițial: $150.00 | Scanner pe Forex, Metale, Energie și Crypto (24/7)
 """
 
 import datetime
+import base64
 import hmac
 import html
 import json
@@ -11,11 +12,13 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
-import ccxt
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     import yfinance as yf
@@ -32,27 +35,26 @@ MT5_AVAILABLE = os.name == "nt" and mt5 is not None
 from storage.mongo_db import MongoManager
 
 # ------------------------- PARAMETRI -------------------------
-EXCHANGE = os.environ.get("EXCHANGE", "binance")
 TIMEFRAME = "15m"
 BAR_MINUTES = 15
 START_CAPITAL = 150.0
 FEE = 0.001
 SLIPPAGE = 0.0002
 MAX_BARS = 48
-COST_RT = 2 * (FEE + SLIPPAGE)
 POLL_SECONDS = 30
 MAX_SIGNAL_AGE = 120
-STALE_PRICE_SECONDS = 900
+STALE_PRICE_SECONDS = 120
+MAX_ENTRY_EXTENSION_ATR = 1.0
 
 # Piețele monitorizate, inclusiv Crypto pentru weekend (24/7)
 MARKETS = {
-    "EURUSD": dict(src="yf", yf="EURUSD=X", fee=0.00005, slip=0.00005, max_age=300),
-    "GBPUSD": dict(src="yf", yf="GBPUSD=X", fee=0.00005, slip=0.00005, max_age=300),
-    "USDJPY": dict(src="yf", yf="USDJPY=X", fee=0.00005, slip=0.00005, max_age=300),
-    "GOLD": dict(src="yf", yf="GC=F", fee=0.0001, slip=0.00015, max_age=300),
-    "OIL": dict(src="yf", yf="CL=F", fee=0.0001, slip=0.0003, max_age=300),
-    "BTCUSD": dict(src="yf", yf="BTC-USD", fee=0.0002, slip=0.0002, max_age=300),
-    "ETHUSD": dict(src="yf", yf="ETH-USD", fee=0.0002, slip=0.0002, max_age=300),
+    "EURUSD": dict(yf="EURUSD=X", fee=0.00005, slip=0.00005),
+    "GBPUSD": dict(yf="GBPUSD=X", fee=0.00005, slip=0.00005),
+    "USDJPY": dict(yf="USDJPY=X", fee=0.00005, slip=0.00005),
+    "GOLD": dict(yf="GC=F", fee=0.0001, slip=0.00015),
+    "OIL": dict(yf="CL=F", fee=0.0001, slip=0.0003),
+    "BTCUSD": dict(yf="BTC-USD", fee=0.0002, slip=0.0002),
+    "ETHUSD": dict(yf="ETH-USD", fee=0.0002, slip=0.0002),
 }
 
 SYMBOL = "EURUSD"
@@ -65,11 +67,7 @@ DEFAULTS = dict(
     stopped=False,
     allow_new_trades=True,
     close_now=False,
-    vol_adjust_stop=True,
     trailing_stop=True,
-    tp_extend=False,
-    tp_extend_atr=0.5,
-    tp_lock_atr=0.2,
     risk_per_trade=0.015,
     trade_amount=50.0,
     execution_mode="paper",
@@ -78,8 +76,6 @@ DEFAULTS = dict(
     atr_stop_mult=1.2,
     trail_activate_atr=0.6,
     trail_atr=0.8,
-    manual_stop=None,
-    manual_tp=None,
 )
 
 
@@ -525,7 +521,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .chart-container { position: relative; height: 300px; width: 100%; margin-top: 15px; }
 """
 
-def render_dashboard(state, ctl, can_act, token_configured, token, history=None):
+def render_dashboard(state, ctl, can_act, history=None):
     history = history or []
     cap = fnum(state.get("capital"), START_CAPITAL)
     mid = fnum(state.get("mid_price"))
@@ -545,7 +541,7 @@ def render_dashboard(state, ctl, can_act, token_configured, token, history=None)
     if pos:
         pos_html = "<div class=\"position-grid\">" + "".join(
             f"<div><span>{label}</span><b>{html.escape(str(pos.get(key, '—')))}</b></div>"
-            for label, key in (("Instrument", "symbol"), ("Direcție", "direction"), ("Intrare", "entry_price"), ("Cantitate", "qty"), (pos.get("notional_label", "Valoare poziție"), "notional"), ("Stop-loss", "target_sl"), ("Take-profit", "target_tp"), ("Lumânări", "bars"))
+            for label, key in (("Instrument", "symbol"), ("Direcție", "direction"), ("Intrare", "entry_price"), ("Cantitate", "qty"), (pos.get("notional_label", "Valoare poziție"), "notional"), ("Risc inițial estimat la SL (moneda contului)", "risk_at_stop"), ("Stop-loss", "target_sl"), ("Take-profit", "target_tp"), ("Lumânări", "bars"))
         ) + "</div>"
     else:
         pos_html = "Nicio poziție deschisă momentan"
@@ -554,20 +550,23 @@ def render_dashboard(state, ctl, can_act, token_configured, token, history=None)
     mode_badges = {"paper": "SIMULARE INTERNĂ", "mt5_demo": "MT5 DEMO", "mt5_live": "MT5 REAL"}
     badge_text = "OPRIT" if stopped else mode_badges.get(ctl.get("execution_mode", "paper"), "MOD NECUNOSCUT")
     pnl_color = "#22c55e" if pnl >= 0 else "#ef4444"
+    feed_note = (
+        '<p class="note">Simularea internă folosește date Yahoo Finance, estimări de cost și execuții simulate; nu reprezintă prețuri sau rezultate Capital.com.</p>'
+        if ctl.get("execution_mode", "paper") == "paper" else
+        '<p class="note">Execuția MT5 folosește prețurile și regulile contului MT5 selectat.</p>'
+    )
 
     if can_act:
-        k = html.escape(token, quote=True)
         selected_mode = str(ctl.get("execution_mode", "paper"))
         mt5_disabled = "" if MT5_AVAILABLE else "disabled"
         toggle = (
-            f'<form method="post" action="/start"><input type="hidden" name="k" value="{k}"><button class="btn">▶ Pornește</button></form>'
+            '<form method="post" action="/start"><button class="btn">▶ Pornește</button></form>'
             if stopped else
-            f'<form method="post" action="/stop"><input type="hidden" name="k" value="{k}"><button class="btn btn-danger">🛑 Oprește</button></form>'
+            '<form method="post" action="/stop"><button class="btn btn-danger">🛑 Oprește</button></form>'
         )
-        actions = f'<form method="post" action="/close_now"><input type="hidden" name="k" value="{k}"><button class="btn btn-danger">🚨 Închide poziția acum</button></form>' + toggle
+        actions = '<form method="post" action="/close_now"><button class="btn btn-danger">🚨 Închide poziția acum</button></form>' + toggle
         settings = f'''<section class="card"><h3>Setări bot</h3>
           <form method="post" action="/settings" class="settings">
-            <input type="hidden" name="k" value="{k}">
             <label>Mod de tranzacționare
               <select name="execution_mode">
                 <option value="paper" {'selected' if selected_mode == 'paper' else ''}>Simulare internă</option>
@@ -583,7 +582,7 @@ def render_dashboard(state, ctl, can_act, token_configured, token, history=None)
             </label>
             <button class="btn">Salvează setările</button>
           </form>
-          <p class="note">Poți modifica oricând capitalul și suma maximă per poziție (plafonată automat la valoarea capitalului curent).{' MT5 este disponibil numai pe Windows cu terminalul pornit; pe acest server folosește Simulare internă.' if not MT5_AVAILABLE else ''}</p>
+          <p class="note">„Sumă maximă alocată” este plafonul de valoare/marjă al poziției, nu riscul la stop. Bugetul de risc configurat este o țintă; plafonul sau volumul minim MT5 îl pot reduce ori pot bloca ordinul.{' MT5 este disponibil numai pe Windows cu terminalul pornit; pe acest server folosește Simulare internă.' if not MT5_AVAILABLE else ''}</p>
         </section>'''
     else:
         actions = '<p class="note">Comenzi inactive (necesită token).</p>'
@@ -597,13 +596,13 @@ def render_dashboard(state, ctl, can_act, token_configured, token, history=None)
     return f"""<!DOCTYPE html>
 <html lang="ro">
 <head>
-<meta charset="UTF-8"><title>Nova Trade v3.1 Scalper</title><meta http-equiv="refresh" content="3">
+<meta charset="UTF-8"><title>Nova Trade v3.1</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>{CSS}</style>
 </head>
 <body>
 <div class="container">
-  <header><h1>⚡ Nova Trade v3.1 - Scalper Dinamic</h1><span class="badge" style="background: {badge_color};">{badge_text}</span></header>
+  <header><h1>⚡ Nova Trade v3.1 - Motor 15m</h1><span class="badge" style="background: {badge_color};">{badge_text}</span></header>
   <div class="grid">
     <div class="card"><h3>Capital</h3><div class="value" style="color: #38bdf8;">${cap:.2f}</div></div>
     <div class="card"><h3>Preț {psym}</h3><div class="value">${fmt_price(mid)}</div></div>
@@ -612,6 +611,7 @@ def render_dashboard(state, ctl, can_act, token_configured, token, history=None)
   </div>
   <div class="pos-box">
     <h3>Status Execuție & Diagramă Live ({psym})</h3>
+    {feed_note}
     <p><b>Motor:</b> {status}</p>
     <p><b>Scanner:</b> <span class="note">{scan_html}</span></p>
     <p><b>Poziție Activă:</b> {pos_html}</p>
@@ -628,6 +628,16 @@ def render_dashboard(state, ctl, can_act, token_configured, token, history=None)
   </div>
 </div>
 <script>
+let dashboardFormDirty = false;
+document.querySelectorAll('form').forEach(form => {{
+  form.addEventListener('input', () => dashboardFormDirty = true);
+  form.addEventListener('change', () => dashboardFormDirty = true);
+}});
+setInterval(() => {{
+  const active = document.activeElement;
+  const editing = active && ['INPUT', 'SELECT', 'TEXTAREA'].includes(active.tagName);
+  if (!dashboardFormDirty && !editing) window.location.reload();
+}}, 3000);
 const ctx = document.getElementById('liveChart').getContext('2d');
 new Chart(ctx, {{
     type: 'line',
@@ -659,10 +669,17 @@ new Chart(ctx, {{
 
 class DashboardHandler(BaseHTTPRequestHandler):
     store = None
-    @staticmethod
-    def _authorized(supplied):
+    def _authorized(self):
         token = os.environ.get("DASHBOARD_TOKEN", "")
-        return bool(token) and hmac.compare_digest(supplied.encode(), token.encode())
+        header = self.headers.get("Authorization", "")
+        if not token or not header.startswith("Basic "):
+            return False
+        try:
+            credentials = base64.b64decode(header[6:], validate=True).decode("utf-8")
+            _, supplied = credentials.split(":", 1)
+        except Exception:
+            return False
+        return hmac.compare_digest(supplied.encode(), token.encode())
 
     def _send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
@@ -676,13 +693,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
-        k = (parse_qs(u.query).get("k") or [""])[0]
         if u.path == "/healthz":
             self._send(200, "ok", "text/plain")
         elif u.path in ("/", "/index.html"):
+            if not os.environ.get("DASHBOARD_TOKEN"):
+                self._send(503, "Dashboard unavailable: configure DASHBOARD_TOKEN.", "text/plain")
+                return
+            if not self._authorized():
+                self._send(401, "Autentificare necesară.", "text/plain", {
+                    "WWW-Authenticate": 'Basic realm="Nova Trade Dashboard", charset="UTF-8"',
+                    "Cache-Control": "no-store",
+                })
+                return
             st = DashboardHandler.store
-            page = render_dashboard(st.load_state() or {}, st.get_control(), self._authorized(k), bool(os.environ.get("DASHBOARD_TOKEN")), k, st.recent_trades())
-            self._send(200, page)
+            page = render_dashboard(st.load_state() or {}, st.get_control(), True, st.recent_trades())
+            self._send(200, page, headers={"Cache-Control": "no-store"})
         else:
             self._send(404, "Not found", "text/plain")
 
@@ -690,9 +715,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         length = min(int(self.headers.get("Content-Length") or 0), 4096)
         form = parse_qs(self.rfile.read(length).decode("utf-8", errors="ignore"))
-        k = (form.get("k") or [""])[0]
-        if not self._authorized(k):
+        if not self._authorized():
             self._send(403, "Interzis", "text/plain")
+            return
+        origin = self.headers.get("Origin", "")
+        proto = self.headers.get("X-Forwarded-Proto", "http").split(",", 1)[0].strip()
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
+        if not origin or origin != f"{proto}://{host}":
+            self._send(403, "Origine invalidă.", "text/plain")
             return
         st = DashboardHandler.store
         if u.path == "/stop": st.set_control(stopped=True)
@@ -748,7 +778,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 self._send(400, "Valori invalide.", "text/plain")
                 return
-        self._send(303, "", "text/plain", {"Location": "/?k=" + quote(k)})
+        self._send(303, "", "text/plain", {"Location": "/"})
 
     def log_message(self, format, *args): pass
 
@@ -758,12 +788,6 @@ def start_health_server():
 
 
 # --------------------------- INDICATORI & SEMNAL ---------------------------
-def to_frame(rows):
-    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    return df
-
 def add_indicators(df):
     df = df.copy()
     c = df["close"]
@@ -774,7 +798,7 @@ def add_indicators(df):
     df["breakout_high"] = df["high"].rolling(20).max().shift(1)
     return df
 
-def signal(r, cost_rt=COST_RT):
+def signal(r, cost_rt=0.0):
     close = r["close"]
     ema_fast = r.get("ema_fast", close)
     ema_trend = r.get("ema_trend", close)
@@ -795,8 +819,6 @@ def fetch_candles(ex, sym):
     if isinstance(ex, MT5Bridge):
         return ex.fetch_ohlcv(sym, TIMEFRAME, limit=500)
     m = MARKETS[sym]
-    if m["src"] == "ccxt":
-        return to_frame(ex.fetch_ohlcv(sym, TIMEFRAME, limit=200))
     if yf is None: raise RuntimeError("yfinance lipsă")
     raw = yf.Ticker(m["yf"]).history(period="5d", interval="15m", auto_adjust=False)
     if raw is None or raw.empty: raise ValueError("fără date")
@@ -814,20 +836,17 @@ def fetch_price(ex, sym, side="buy"):
     if isinstance(ex, MT5Bridge):
         tick = ex.fetch_ticker(sym)
         age = time.time() - tick["time_utc"]
-        fresh = -120 <= age <= STALE_PRICE_SECONDS
+        fresh = 0 <= age <= STALE_PRICE_SECONDS
         return fnum(tick["ask"] if side == "buy" else tick["bid"]), fresh
     m = MARKETS[sym]
-    if m["src"] == "ccxt":
-        t = ex.fetch_ticker(sym)
-        return fnum(t.get("last") or t.get("close")), True
     if yf is None: raise RuntimeError("yfinance lipsă")
     h = yf.Ticker(m["yf"]).history(period="1d", interval="1m", auto_adjust=False)
     if h is None or h.empty: return 0.0, False
-    return fnum(h["Close"].iloc[-1]), (utc_now() - _naive_utc(h.index)[-1]).total_seconds() <= STALE_PRICE_SECONDS
+    age = (utc_now() - _naive_utc(h.index)[-1]).total_seconds()
+    return fnum(h["Close"].iloc[-1]), (0 <= age <= STALE_PRICE_SECONDS)
 
 def scan_markets(ex, now, slot, scanned, scan_info):
     best = None
-    age = (now - slot).total_seconds()
     for sym, m in MARKETS.items():
         if scanned.get(sym) == slot: continue
         try:
@@ -840,12 +859,27 @@ def scan_markets(ex, now, slot, scanned, scan_info):
             scan_info[sym] = "date insuficiente"
             continue
         bar = closed.iloc[-1]
+        bar_end = bar["ts"] + pd.Timedelta(minutes=BAR_MINUTES)
+        signal_age = (now - bar_end).total_seconds()
+        if bar_end != slot or signal_age < 0 or signal_age > MAX_SIGNAL_AGE:
+            scan_info[sym] = "lumânare întârziată; semnal ignorat"
+            # Yahoo may publish the just-closed candle a little late. Do not
+            # mark this slot scanned while its latest available candle is old;
+            # the next poll can retry and see the candle once it appears.
+            if bar_end == slot and signal_age > MAX_SIGNAL_AGE:
+                scanned[sym] = slot
+            continue
         scanned[sym] = slot
         cost_rt = 2 * (m["fee"] + m["slip"])
-        if age <= m["max_age"] and signal(bar, cost_rt):
+        if signal(bar, cost_rt):
             score = float((bar["close"] - bar["ema_fast"]) / bar["atr"])
-            scan_info[sym] = f"SEMNAL (scor {score:.2f})"
-            if best is None or score > best[0]:
+            if score > MAX_ENTRY_EXTENSION_ATR:
+                scan_info[sym] = f"prea extins față de EMA (ATR {score:.2f}); ignorat"
+                continue
+            scan_info[sym] = f"SEMNAL (extensie {score:.2f} ATR)"
+            # Among eligible breakouts, prefer the least extended entry rather
+            # than chasing the move that has already travelled furthest.
+            if best is None or score < best[0]:
                 best = (score, sym, bar)
         else:
             scan_info[sym] = "fără semnal"
@@ -893,10 +927,14 @@ class Engine:
         )
         target = float(broker_pos.tp or 0.0)
         margin = float(mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, broker_pos.symbol, broker_pos.volume, broker_pos.price_open) or 0.0)
+        risk_at_stop = abs(float(mt5.order_calc_profit(
+            mt5.ORDER_TYPE_BUY, broker_pos.symbol, broker_pos.volume,
+            broker_pos.price_open, stop,
+        ) or 0.0)) if stop > 0 else 0.0
         self.pos = dict(
             entry=float(broker_pos.price_open), stop=stop, tp=target, qty=float(broker_pos.volume),
             bars=max(0, int((utc_now() - opened).total_seconds() // (BAR_MINUTES * 60))),
-            hh=high_water, atr0=atr, fee_in=0.0, t=opened, t_open=opened,
+            hh=high_water, atr0=atr, fee_in=0.0, risk_at_stop=risk_at_stop, t=opened, t_open=opened,
             margin=margin, symbol=alias, mt5_ticket=int(broker_pos.ticket),
             mt5_identifier=int(getattr(broker_pos, "identifier", broker_pos.ticket)),
             mt5_mode=mode, fee=MARKETS[alias]["fee"], slip=MARKETS[alias]["slip"],
@@ -943,6 +981,8 @@ class Engine:
                     self.pos = dict(
                         entry=pos.price_open, stop=pos.sl, tp=pos.tp, qty=pos.volume,
                         bars=0, hh=pos.price_open, atr0=atr, fee_in=0.0,
+                        risk_at_stop=abs(float(mt5.order_calc_profit(mt5.ORDER_TYPE_BUY, pos.symbol, pos.volume, pos.price_open, pos.sl) or 0.0)),
+                        risk_budget_target=risk_budget,
                         t=bar["ts"], t_open=utc_now(), margin=pos_margin,
                         symbol=symbol, mt5_ticket=int(pos.ticket), mt5_identifier=int(pos.identifier),
                         mt5_mode=mode, fee=fee, slip=slip, broker_profit=float(pos.profit)
@@ -960,11 +1000,20 @@ class Engine:
         risk_per_unit = quote_to_usd(symbol, entry - stop, entry)
         qty = risk_budget / risk_per_unit
         max_allowed_amount = min(c.get("trade_amount", 50.0), self.equity)
-        qty = min(qty, max_allowed_amount / entry, self.equity * 0.99 / entry)
+        if symbol == "USDJPY":
+            # USDJPY quantity is already denominated in the USD base currency;
+            # dividing the USD notional cap by the JPY quote price shrinks it
+            # by roughly 1/150 and produces a near-zero paper position.
+            qty = min(qty, max_allowed_amount, self.equity * 0.99)
+        else:
+            qty = min(qty, max_allowed_amount / entry, self.equity * 0.99 / entry)
         if qty <= 0: return
+        fee_in = float(quote_to_usd(symbol, qty * entry * fee, entry))
+        risk_at_stop = qty * risk_per_unit + fee_in + float(quote_to_usd(symbol, qty * stop * fee, stop))
         self.pos = dict(
             entry=entry, stop=stop, tp=tp, qty=float(qty), bars=0, hh=entry,
-            atr0=atr, fee_in=float(quote_to_usd(symbol, qty * entry * fee, entry)), t=bar["ts"],
+            atr0=atr, fee_in=fee_in, risk_at_stop=float(risk_at_stop),
+            risk_budget_target=float(risk_budget), t=bar["ts"],
             t_open=utc_now(), margin=round(self.equity * c["risk_per_trade"], 2),
             symbol=symbol, fee=fee, slip=slip,
         )
@@ -1013,7 +1062,8 @@ class Engine:
             self._close(min(price, p["stop"]) * (1 - slip), "STOP", now, ex)
             return True, "STOP_LOSS"
         if price >= p["tp"]:
-            self._close(p["tp"], "TP", now, ex)
+            # Apply adverse slippage to the simulated exit, including take-profit.
+            self._close(p["tp"] * (1 - slip), "TP", now, ex)
             return True, "TAKE_PROFIT"
         if p["bars"] >= MAX_BARS:
             self._close(price * (1 - slip), "TIME", now, ex)
@@ -1083,7 +1133,6 @@ def run_paper_loop():
     DashboardHandler.store = store
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    ccxt_ex = getattr(ccxt, EXCHANGE)({"enableRateLimit": True})
     eng = Engine(START_CAPITAL, store.get_control(), on_trade=store.add_trade)
 
     saved = store.load_state()
@@ -1145,7 +1194,7 @@ def run_paper_loop():
                     eng.day = utc_now().date()
                     eng.day_start = eng.equity
 
-            ex = current_mt5_bridge if mode in ("mt5_demo", "mt5_live") and current_mt5_bridge else ccxt_ex
+            ex = current_mt5_bridge if mode in ("mt5_demo", "mt5_live") and current_mt5_bridge else None
 
             if current_mt5_bridge is not None:
                 account = mt5.account_info()
@@ -1246,6 +1295,7 @@ def run_paper_loop():
                     "target_tp": rnd(p["tp"]),
                     "target_sl": rnd(p["stop"]),
                     "notional": round(usd_notional(p.get("symbol", SYMBOL), p["qty"], p["entry"]), 2),
+                    "risk_at_stop": round(float(p.get("risk_at_stop", 0.0)), 4),
                     "notional_label": "Marjă poziție" if mode != "paper" else "Valoare poziție",
                     "bars": p["bars"],
                 }

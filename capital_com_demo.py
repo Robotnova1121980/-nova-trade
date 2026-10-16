@@ -577,6 +577,10 @@ def run() -> int:
                     print(f"[{alias}] Blocat/eroare API: {exc}")
                 except Exception as exc:
                     print(f"[{alias}] Eroare; nu se trimite alt ordin pe această lumânare: {exc}")
+                
+                # Pauză de 2 secunde adăugată pentru a preveni HTTP 429 Too Many Requests
+                time.sleep(2)
+
             if orders_enabled and trading_client is not None and not baseline_needed:
                 manage_trailing_stops(trading_client, read_client, runner_store, markets)
             baseline_needed = False

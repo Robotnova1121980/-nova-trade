@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -37,6 +38,8 @@ ATR_STOP_MULTIPLIER = 1.2
 ATR_TARGET_MULTIPLIER = 1.5
 MAX_SPREAD_PCT = 0.001
 SLIPPAGE_ESTIMATE_PCT = 0.0002
+ADX_MIN_TREND = 25.0
+MAX_SPREAD_TO_STOP = 0.15
 POLL_SECONDS = 15
 DEFAULT_RISK_PERCENT = 0.5
 MAX_RISK_PERCENT = 5.0
@@ -109,12 +112,46 @@ def closed_candles(rows: list[dict[str, Any]]) -> pd.DataFrame:
     frame["atr"] = true_range.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
     frame["breakout_high"] = frame["high"].astype(float).rolling(BREAKOUT_PERIOD).max().shift(1)
     frame["breakout_low"] = frame["low"].astype(float).rolling(BREAKOUT_PERIOD).min().shift(1)
+
+    # Wilder-smoothed ADX, same definition as the regime filter in the backtest.
+    up = frame["high"].astype(float).diff()
+    down = -frame["low"].astype(float).diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=frame.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=frame.index)
+    smooth_atr = true_range.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean() / smooth_atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean() / smooth_atr
+    denominator = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / denominator
+    frame["adx"] = dx.ewm(alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False).mean()
     return frame.dropna(subset=["ema_trend", "atr", "breakout_high", "breakout_low"])
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if math.isfinite(value) else default
 
 
 def breakout_direction(bar: pd.Series, spread_pct: float) -> str | None:
     # Use mirrored trend/breakout rules for long and short entries.
     total_cost_estimate = spread_pct + (2 * SLIPPAGE_ESTIMATE_PCT)
+
+    # Regime filter: skip breakouts while the market is not trending.
+    # A missing ADX value (not enough bars) blocks the signal.
+    adx_min = _env_float("CAPITAL_DEMO_ADX_MIN", ADX_MIN_TREND)
+    if not (float(bar["adx"]) >= adx_min):
+        return None
+
+    # Cost filter relative to the stop distance: skip entries where the spread
+    # alone would consume too large a share of the planned 1R risk.
+    stop_pct = ATR_STOP_MULTIPLIER * float(bar["atr"]) / float(bar["close"])
+    max_spread_to_stop = _env_float("CAPITAL_DEMO_MAX_SPREAD_TO_STOP", MAX_SPREAD_TO_STOP)
+    if not (stop_pct > 0) or spread_pct / stop_pct > max_spread_to_stop:
+        return None
+
     buy_signal = bool(
         float(bar["close"]) > float(bar["ema_fast"])
         and float(bar["ema_fast"]) > float(bar["ema_trend"])
@@ -467,7 +504,8 @@ def run() -> int:
                     currency = account.get("currency") or account.get("currencyIsoCode") or "monedă cont"
                     print(
                         f"[{alias}] Semnal {direction}; mărime={size:g}, "
-                        f"pierdere estimată la SL={estimated_risk:.2f}/{risk_budget:.2f} {currency}, "
+                        f"risc estimat la distanța ATR={estimated_risk:.2f}/{risk_budget:.2f} {currency}, "
+                        f"stop monetar solicitat={os.getenv('CAPITAL_DEMO_MAX_LOSS_AMOUNT', '1.0')} {currency}, "
                         f"marjă estimată={estimated_margin:.2f} {currency}. Trimit ordin Demo."
                     )
                     if trading_client is None:
@@ -485,12 +523,15 @@ def run() -> int:
                     )
                     print(
                         f"[{alias}] Ordin confirmat: status={result['deal_status']} "
-                        f"| referință={result['deal_reference']}"
+                        f"| referință={result['deal_reference']} "
+                        f"| stop monetar activ={result['stop_amount']:g} {currency}"
                     )
                     runner_store.log_event(
-                        "ORDER_ACCEPTED", f"Ordin {direction} confirmat pe {alias}.",
+                        "ORDER_ACCEPTED",
+                        f"Ordin {direction} confirmat pe {alias}; stop monetar configurat.",
                         epic=epic, alias=alias, direction=direction, size=size,
-                        stop_level=stop, profit_level=target,
+                        atr_stop_reference=stop, stop_amount=result["stop_amount"],
+                        trailing_stop=False, profit_level=target,
                         deal_reference=result["deal_reference"],
                     )
                 except CapitalComDemoError as exc:

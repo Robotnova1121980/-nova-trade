@@ -143,6 +143,7 @@ def breakout_direction(bar: pd.Series, spread_pct: float) -> str | None:
     # A missing ADX value (not enough bars) blocks the signal.
     adx_min = _env_float("CAPITAL_DEMO_ADX_MIN", ADX_MIN_TREND)
     if not (float(bar["adx"]) >= adx_min):
+        print(f"   motiv respingere: ADX {float(bar['adx']):.1f} < {adx_min:g}")
         return None
 
     # Cost filter relative to the stop distance: skip entries where the spread
@@ -150,6 +151,8 @@ def breakout_direction(bar: pd.Series, spread_pct: float) -> str | None:
     stop_pct = ATR_STOP_MULTIPLIER * float(bar["atr"]) / float(bar["close"])
     max_spread_to_stop = _env_float("CAPITAL_DEMO_MAX_SPREAD_TO_STOP", MAX_SPREAD_TO_STOP)
     if not (stop_pct > 0) or spread_pct / stop_pct > max_spread_to_stop:
+        ratio = spread_pct / stop_pct if stop_pct > 0 else float("nan")
+        print(f"   motiv respingere: spread/stop {ratio:.3f} > {max_spread_to_stop:g}")
         return None
 
     buy_signal = bool(
@@ -168,6 +171,11 @@ def breakout_direction(bar: pd.Series, spread_pct: float) -> str | None:
         return "BUY"
     if sell_signal:
         return "SELL"
+    print(
+        f"   motiv respingere: fără breakout valid (close={float(bar['close']):.4f}, "
+        f"max20={float(bar['breakout_high']):.4f}, min20={float(bar['breakout_low']):.4f}, "
+        f"ema9={float(bar['ema_fast']):.4f}, ema50={float(bar['ema_trend']):.4f})"
+    )
     return None
 
 
